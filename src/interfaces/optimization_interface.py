@@ -431,6 +431,17 @@ class OptimizationInterface:
                     dyn_override_active = True
 
             self.last_control_data[0]["discharge_allowed"] = discharge_allowed
+            # Apply the override to the next slot as well. The fast control loop
+            # switches to entry 1 as soon as the slot boundary is crossed, which
+            # usually happens before the next optimization run. Without this,
+            # entry 1 still holds the raw optimizer value, so the inverter is set
+            # to AVOID DISCHARGE at every slot change until the next run.
+            # Entry 1 is only touched if the override is active for that slot.
+            if (
+                next_step < len(dyn_override_allowed_array)
+                and dyn_override_allowed_array[next_step]
+            ):
+                self.last_control_data[1]["discharge_allowed"] = True
             # Store the dynamic override state for later use (e.g., in web UI)
             self.last_control_data[0]["dyn_override_active"] = dyn_override_active
             # Store the array of override states for all slots
@@ -595,6 +606,21 @@ class OptimizationInterface:
                 next_quarter.strftime("%H:%M:%S"),
             )
 
+        # Skip a quarter that is too close to reach. This must happen before the
+        # gap-fill check: otherwise a run finishing a few seconds before a
+        # boundary fails the gap-fill check against the near quarter, is then
+        # moved to the following one, and no run happens for a full slot.
+        absolute_min_seconds = max(avg_runtime * 0.5, 30)
+        if (
+            quarter_aligned_start - current_time
+        ).total_seconds() < absolute_min_seconds:
+            next_quarter += timedelta(minutes=15)
+            quarter_aligned_start = next_quarter - timedelta(seconds=avg_runtime)
+            logger.debug(
+                "[OPTIMIZATION] Quarter too close, moved to next: %s",
+                next_quarter.strftime("%H:%M:%S"),
+            )
+
         time_until_quarter_start = (
             quarter_aligned_start - current_time
         ).total_seconds()
@@ -623,15 +649,6 @@ class OptimizationInterface:
             return normal_next_start
 
         # Otherwise, use quarter-aligned timing
-        absolute_min_seconds = max(avg_runtime * 0.5, 30)
-        if time_until_quarter_start < absolute_min_seconds:
-            next_quarter += timedelta(minutes=15)
-            quarter_aligned_start = next_quarter - timedelta(seconds=avg_runtime)
-            logger.debug(
-                "[OPTIMIZATION] Quarter too close, moved to next: %s",
-                next_quarter.strftime("%H:%M:%S"),
-            )
-
         logger.info(
             "[OPTIMIZATION] Quarter-hour aligned run: start %s, finish at %s",
             quarter_aligned_start.strftime("%H:%M:%S"),
