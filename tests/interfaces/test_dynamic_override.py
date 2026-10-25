@@ -596,5 +596,143 @@ class TestDynamicOverrideLogic:
             assert override_array[12] == False
 
 
+class TestDynamicOverrideNextSlot:
+    """
+    The fast control loop switches to control entry 1 (next slot) as soon as the
+    slot boundary is crossed - usually before the next optimization run. Entry 1
+    must therefore already carry the PV > Load override, otherwise the inverter is
+    briefly set to AVOID DISCHARGE at every slot change.
+    """
+
+    # The module-level fixtures above are requested by name, which pylint reports
+    # as redefining the outer name.
+    # pylint: disable=redefined-outer-name
+
+    @staticmethod
+    def _run_at(interface, tz, response, hour, minute=0):
+        with patch("src.interfaces.optimization_interface.datetime") as mock_datetime:
+            mock_datetime.now.return_value = tz.localize(
+                datetime(2024, 10, 4, hour, minute, 0)
+            )
+            mock_datetime.side_effect = datetime
+            interface.examine_response_to_control_data(response)
+        return interface.get_last_control_data()
+
+    @patch("src.interfaces.optimization_interface.EVOptBackend", MagicMock())
+    def test_next_slot_carries_override(
+        self,
+        config_with_override_enabled,
+        berlin_timezone,
+        eos_request_with_pv_greater_than_load,
+        eos_response_discharge_not_allowed,
+    ):
+        """Current slot without override (PV 200 < Load 400), next slot with
+        override (PV 500 > Load 400, no AC charge) -> entry 1 must be True."""
+        interface = OptimizationInterface(
+            config=config_with_override_enabled,
+            time_frame_base=3600,
+            timezone=berlin_timezone,
+        )
+        interface.last_eos_request = eos_request_with_pv_greater_than_load
+
+        control = self._run_at(
+            interface, berlin_timezone, eos_response_discharge_not_allowed, 1
+        )
+
+        assert not control[0]["discharge_allowed"]
+        assert control[0]["dyn_override_active"] is False
+        assert control[1]["discharge_allowed"] is True
+
+    @patch("src.interfaces.optimization_interface.EVOptBackend", MagicMock())
+    def test_next_slot_without_override_keeps_optimizer_value(
+        self,
+        config_with_override_enabled,
+        berlin_timezone,
+        eos_request_with_pv_greater_than_load,
+        eos_response_discharge_not_allowed,
+    ):
+        """Next slot PV 0 < Load 400 -> entry 1 keeps the optimizer's False."""
+        interface = OptimizationInterface(
+            config=config_with_override_enabled,
+            time_frame_base=3600,
+            timezone=berlin_timezone,
+        )
+        interface.last_eos_request = eos_request_with_pv_greater_than_load
+
+        control = self._run_at(
+            interface, berlin_timezone, eos_response_discharge_not_allowed, 14
+        )
+
+        assert not control[1]["discharge_allowed"]
+
+    @patch("src.interfaces.optimization_interface.LocalEVOptBackend", MagicMock())
+    def test_next_slot_quarter_hour_local_evopt(self, berlin_timezone):
+        """Quarter-hour slots with the built-in local_evopt optimizer.
+
+        08:00 = step 32: PV 100 < Load 400, no override.
+        08:15 = step 33: PV 800 > Load 400, no AC charge -> override.
+        08:30 = step 34: PV 800 > Load 400, but AC charge requested -> no override.
+        """
+        config = {
+            "source": "local_evopt",
+            "timeout": 60,
+            "time_frame": 900,
+            "dyn_override_discharge_allowed_pv_greater_load": True,
+        }
+        slots = 96
+        pv = [0] * slots
+        pv[32] = 100
+        pv[33] = 800
+        pv[34] = 800
+        ac_charge = [0] * slots
+        ac_charge[34] = 0.5
+        response = {
+            "ac_charge": ac_charge,
+            "dc_charge": [0] * slots,
+            "discharge_allowed": [0] * slots,
+            "start_solution": [0, 0],
+        }
+        interface = OptimizationInterface(
+            config=config, time_frame_base=900, timezone=berlin_timezone
+        )
+        interface.last_eos_request = {
+            "ems": {"pv_prognose_wh": pv, "gesamtlast": [400] * slots}
+        }
+
+        control = self._run_at(interface, berlin_timezone, response, 8, 0)
+        assert control[0]["slot"] == 32 and control[1]["slot"] == 33
+        assert not control[0]["discharge_allowed"]
+        assert control[1]["discharge_allowed"] is True
+
+        # Next slot has AC charging requested -> override not active,
+        # entry 1 keeps the optimizer value.
+        control = self._run_at(interface, berlin_timezone, response, 8, 15)
+        assert control[0]["slot"] == 33 and control[1]["slot"] == 34
+        assert control[0]["discharge_allowed"] is True
+        assert not control[1]["discharge_allowed"]
+
+    @patch("src.interfaces.optimization_interface.EOSBackend", MagicMock())
+    def test_next_slot_untouched_when_override_disabled(
+        self,
+        config_with_override_disabled,
+        berlin_timezone,
+        eos_request_with_pv_greater_than_load,
+        eos_response_discharge_not_allowed,
+    ):
+        """Override disabled -> entry 1 stays at the raw optimizer value."""
+        interface = OptimizationInterface(
+            config=config_with_override_disabled,
+            time_frame_base=3600,
+            timezone=berlin_timezone,
+        )
+        interface.last_eos_request = eos_request_with_pv_greater_than_load
+
+        control = self._run_at(
+            interface, berlin_timezone, eos_response_discharge_not_allowed, 1
+        )
+
+        assert not control[1]["discharge_allowed"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

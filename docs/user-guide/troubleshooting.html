@@ -108,6 +108,22 @@
                             message repeats, the entity itself is the problem &mdash; check it in
                             Home Assistant or OpenHAB.</p>
 
+                        <h3 id="tb-quarter-hour-hold">The battery holds for a moment at every quarter hour</h3>
+                        <p><strong>Symptom:</strong> with the dynamic PV override switched on, the inverter
+                            changes to <em>avoid discharge</em> right at the start of a slot and back to
+                            <em>discharge allowed</em> a few seconds or minutes later &mdash; occasionally
+                            only when the slot is already over. The log shows the two changes in quick
+                            succession:</p>
+                        <pre><code>[Main] Inverter mode set to MODE AVOID DISCHARGE, PV charge rate: 6000 W
+[OPTIMIZATION] Dynamic PV&gt;Load override ACTIVATED for step 63 (...)
+[Main] Inverter mode set to MODE DISCHARGE ALLOWED, PV charge rate: 6000 W</code></pre>
+                        <p><strong>Cause:</strong> the override was applied only to the slot that was
+                            current when the optimization ran. At the slot change the control loop moved on
+                            to the next slot, which still carried the optimizer's own decision, until the
+                            next run corrected it.</p>
+                        <p><strong>Fix:</strong> update EOS Connect. The override now covers the next slot
+                            as well, so the mode is right from the first second of a slot.</p>
+
                         <h3 id="tb-ha-history">Home Assistant history times out on startup</h3>
                         <p>On a large recorder database &mdash; MariaDB with years of history is the
                             usual case &mdash; building the load profile could flood Home Assistant with

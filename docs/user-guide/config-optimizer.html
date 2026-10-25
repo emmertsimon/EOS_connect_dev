@@ -171,6 +171,9 @@
                         default.</p>
                     <p>It never overrides a slot where grid charging was requested, and a manual override
                         you set in the dashboard always wins over it.</p>
+                    <p>The override applies from the first second of a slot. The inverter does not briefly
+                        drop to <em>avoid discharge</em> at the slot change while the next optimization run
+                        is still pending.</p>
                     <div data-schema-section="eos" data-schema-anchor="dyn-override"></div>
                 </div>
 

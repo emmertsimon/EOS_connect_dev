@@ -431,6 +431,17 @@ class OptimizationInterface:
                     dyn_override_active = True
 
             self.last_control_data[0]["discharge_allowed"] = discharge_allowed
+            # Apply the override to the next slot as well. The fast control loop
+            # switches to entry 1 as soon as the slot boundary is crossed, which
+            # usually happens before the next optimization run. Without this,
+            # entry 1 still holds the raw optimizer value, so the inverter is set
+            # to AVOID DISCHARGE at every slot change until the next run.
+            # Entry 1 is only touched if the override is active for that slot.
+            if (
+                next_step < len(dyn_override_allowed_array)
+                and dyn_override_allowed_array[next_step]
+            ):
+                self.last_control_data[1]["discharge_allowed"] = True
             # Store the dynamic override state for later use (e.g., in web UI)
             self.last_control_data[0]["dyn_override_active"] = dyn_override_active
             # Store the array of override states for all slots
