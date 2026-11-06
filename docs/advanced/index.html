@@ -765,6 +765,127 @@ mosquitto_pub -h broker -t eos_connect/control/overall_state/set -m "-2"</code><
                         <code>inverter.charge_from_grid</code>, <code>inverter.avoid_discharge</code> and
                         <code>inverter.discharge_allowed</code>. That covers inverters EOS Connect has no
                         native driver for, as long as HA can already control them.</p>
+
+                    <h4 id="home-assistant-sungrow">Example: Sungrow SH hybrid inverters over Modbus</h4>
+                    <p>Sungrow SH-RT and SH-T hybrids (SH5.0RT &hellip; SH15T) take their battery commands as
+                        Modbus holding registers, which Home Assistant's built-in <code>modbus</code>
+                        integration can write with <code>modbus.write_register</code>. Use the inverter's LAN
+                        port where you can; the WiNet-S dongle only delivers all values on current firmware.
+                        The register sequences below are the ones EVCC's <code>sungrow-hybrid</code> template
+                        uses, with one difference: grid charging gets the power EOS Connect asks for instead of
+                        always the maximum.</p>
+                    <div class="scroll-x">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>EOS Connect mode</th>
+                                    <th>Registers to write (in this order)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td><code>charge_from_grid</code></td>
+                                    <td>13049 = 2 (forced mode), 13050 = 0xAA (charge), 33047 = normal discharge
+                                        limit, 13051 = charge power in W</td>
+                                </tr>
+                                <tr>
+                                    <td><code>avoid_discharge</code></td>
+                                    <td>13049 = 0 (self-consumption), 13050 = 0xCC (stop), 33047 = 1 (10 W, the
+                                        lowest allowed value; PV can still charge)</td>
+                                </tr>
+                                <tr>
+                                    <td><code>discharge_allowed</code></td>
+                                    <td>13050 = 0xCC, 13049 = 0, 33047 = normal discharge limit</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p>Addresses are the zero-based protocol addresses (the documented register number minus
+                        one). 33046 and 33047 are the battery's maximum charge and discharge power in units of
+                        10 W; read both once (<code>input_type: holding</code>) to find your normal values,
+                        typically the BDC rated power from input register 5627. A script per mode keeps the
+                        inverter config short. The grid-charge script takes the power as a field:</p>
+                    <pre><code>script:
+  eos_battery_charge:
+    mode: queued
+    fields:
+      power:
+        selector:
+          number: {min: 0, max: 10000, unit_of_measurement: W}
+    sequence:
+      - action: modbus.write_register
+        data: {hub: sungrow, slave: 1, address: 13049, value: 2}
+      - action: modbus.write_register
+        data: {hub: sungrow, slave: 1, address: 13050, value: 170}
+      - action: modbus.write_register
+        data: {hub: sungrow, slave: 1, address: 33047, value: 900}
+      - action: modbus.write_register
+        data: {hub: sungrow, slave: 1, address: 13051, value: "{{ power | int(0) }}"}</code></pre>
+                    <p>and the inverter settings call the three scripts:</p>
+                    <pre><code>inverter.type:              homeassistant
+inverter.charge_from_grid:  [{"service": "script.eos_battery_charge", "data_template": {"power": "{{ power }}"}}]
+inverter.avoid_discharge:   [{"service": "script.eos_battery_hold"}]
+inverter.discharge_allowed: [{"service": "script.eos_battery_normal"}]</code></pre>
+                    <p>For the sensors EOS Connect reads, the same Modbus connection gives you everything
+                        without EVCC (input registers, slave 1):</p>
+                    <div class="scroll-x">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Value</th>
+                                    <th>Address, type, scale</th>
+                                    <th>Notes</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>Battery SOC</td>
+                                    <td>13022, int16, 0.1 %</td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td>Battery power</td>
+                                    <td>13021, int16, W</td>
+                                    <td>Unsigned on many firmwares: negate it while bit 1 of the running state
+                                        (13000) is set or the battery current (13020, int16, 0.1 A) is negative,
+                                        so that charging is negative</td>
+                                </tr>
+                                <tr>
+                                    <td>Grid power</td>
+                                    <td>13009, int32, swap word, W</td>
+                                    <td>Export is positive; use <code>scale: -1</code> for import-positive</td>
+                                </tr>
+                                <tr>
+                                    <td>PV power (DC)</td>
+                                    <td>5016, uint32, swap word, W</td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td>House load</td>
+                                    <td>13007, int32, swap word, W</td>
+                                    <td>Measured AC load; about 50&ndash;100 W lower than PV + grid + battery,
+                                        which also contains the inverter's own losses</td>
+                                </tr>
+                                <tr>
+                                    <td>PV generation total</td>
+                                    <td>13002, uint32, swap word, 0.1 kWh</td>
+                                    <td>For <code>pv_autoscaling.sensor_entity_id</code></td>
+                                </tr>
+                                <tr>
+                                    <td>Battery temperature</td>
+                                    <td>13024, int16, 0.1 &deg;C</td>
+                                    <td>For <code>battery.sensor_battery_temperature</code></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p>Two things to know. EOS Connect writes to the inverter only when its mode changes, so
+                        anything else that writes these registers (a manual forced discharge, another energy
+                        manager) stays in effect until the next change. And 33046 also caps forced charging:
+                        lowering it near full charge (for example with an automation keyed to the SOC) slows
+                        both PV and grid charging at the top, which gives the battery's cell balancing more
+                        time.</p>
+
                     <p><strong>As a dashboard</strong>, MQTT auto-discovery gives you the full entity set
                         described above with no configuration.</p>
 
