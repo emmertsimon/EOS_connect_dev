@@ -1,0 +1,39 @@
+name: "EOS connect develop + Heizung (PR 368)"
+description: "TEST: aktueller EOS-Connect-develop mit dem Heizungs-PR #368 obendrauf. Wird lokal gebaut. Nicht gleichzeitig mit dem develop- oder stabilen Add-on laufen lassen."
+version: "0.3.42.396-pr368.1"
+slug: "eos_connect_heat_test"
+url: "https://github.com/ohAnd/EOS_connect/pull/368"
+arch:
+  - aarch64
+  - amd64
+
+# Kein "image:" -> der Supervisor baut das Add-on lokal aus dem Dockerfile.
+# boot: manual -> startet nach einem HA-Neustart nicht von allein neben dem develop-Add-on.
+boot: manual
+init: false
+
+panel_icon: mdi:home-thermometer
+panel_title: "EOS Heiz-Test"
+panel_admin: false
+
+ingress: true
+ingress_port: 8081
+
+map:
+  - type: app_config
+    read_only: false
+    path: /app/addon_config
+
+# Außen 8082, damit es nicht mit dem develop-Add-on (8081) kollidiert.
+ports:
+  8081/tcp: 8082
+ports_description:
+  8081/tcp: "EOS Connect Webserver (außen 8082)."
+
+options:
+  time_zone: "Europe/Berlin"
+  log_level: "info"
+
+schema:
+  time_zone: str
+  log_level: list(debug|info|warning|error)

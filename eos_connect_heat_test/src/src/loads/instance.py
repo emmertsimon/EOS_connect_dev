@@ -1,0 +1,782 @@
+"""
+One configured managed load, from sensors to a release signal.
+
+`ManagedLoad` is where the pieces meet: it asks its model what is needed, has the planner
+place it, lets the gate decide whether that means "run now", and publishes the result as
+a `LoadContribution`. Everything appliance-specific lives in the model; everything here
+is the same for a pool, a sauna and a pushed heating profile.
+
+The single most important thing this class does is keep the forecast and the control
+signal derived from **one** plan. If the array handed to the optimizer said the pump runs
+at 13:00 while the gate released it at 16:00, the optimizer would be planning the battery
+around a load that never appears - which is precisely the failure mode that makes people
+give up on `additional_load_1` in issues #34 and #201.
+"""
+
+import logging
+import math
+from datetime import timedelta
+
+from .contribution import (
+    KIND_PROFILE,
+    SOURCE_API,
+    SOURCE_INTERNAL,
+    SOURCE_MQTT,
+    SOURCE_PULL,
+    LoadContribution,
+)
+from .gate import OverrideNotSupported, ReleaseGate
+from .planner import (
+    NON_BLOCKING_REASONS,
+    plan_price,
+    reasons_for_schedule,
+    SLOT_DEADLINE,
+    SLOT_PAST,
+    SLOT_PLANNED,
+    SLOT_PRICE,
+    PlanOptions,
+    plan_contingent,
+)
+from . import efficiency as slot_efficiency
+from .presets import (
+    CONTINGENT_TYPES,
+    EXTERNAL_TYPES,
+    apply_defaults,
+    build_model,
+    is_evcc_loadpoint_series,
+)
+
+logger = logging.getLogger("__main__")
+
+
+def _as_ct_per_kwh(eur_per_wh):
+    """Back to the unit the user set the limit in, or None when nothing was placed."""
+    if eur_per_wh is None:
+        return None
+    return round(eur_per_wh * 100.0 * 1000.0, 2)
+
+
+def _offerable(demand):
+    """
+    Whether *demand* is something an optimizer can be asked to place.
+
+    A store planned by temperature counts even when it wants nothing right now:
+    whether to bank heat ahead of a cheap or sunny hour is the solver's question, not
+    ours. This is the one rule for both sides of the handover - what ``schedulable``
+    offers, and what a load waits on the optimizer for.
+    """
+    if demand is None or (demand.max_power_w or 0) <= 0:
+        return False
+    return demand.store is not None or (demand.total_wh or 0) > 0
+
+
+# How long a contribution computed internally stays valid. Long enough to survive a
+# skipped cycle, short enough that a wedged poll thread stops inflating the forecast
+# instead of holding a stale demand there for a day.
+_INTERNAL_TTL_CYCLES = 3
+_INTERNAL_TTL_MIN_MINUTES = 15
+
+
+# One load is one object: the config, the model, the gate, the plan, the demand and the
+# state they leave behind are all *it*, so the attribute count is the design, not sloth.
+# pylint: disable=too-many-instance-attributes
+class ManagedLoad:
+    """A single entry from the ``managed_loads`` config section."""
+
+    def __init__(self, entry, cycle_seconds=300):
+        resolved = apply_defaults(entry)
+        self.config = resolved
+        self.id = str(resolved.get("id", "")).strip()
+        self.type = str(resolved.get("type", "")).strip()
+        self.enabled = bool(resolved.get("enabled", True))
+        self.priority = int(resolved.get("priority", 100) or 100)
+        self.exclusive_group = str(resolved.get("exclusive_group", "") or "").strip()
+        self.subtract_from_base_load = bool(resolved.get("subtract_from_base_load", True))
+        self.power_sensor = str(resolved.get("power_sensor", "") or "").strip()
+        # The meter an externally fed load's forecast stands in for. Separate from
+        # ``power_sensor`` because on those types it was only ever the base-load
+        # subtraction: there is no efficiency to measure and no sample to record, so
+        # sharing one field meant sharing a description that described none of it.
+        self.replaces_sensor = str(resolved.get("replaces_sensor", "") or "").strip()
+
+        self.cycle_seconds = max(30, int(cycle_seconds or 300))
+        self.model = build_model(resolved)
+        self.gates_release = self.type in CONTINGENT_TYPES
+        self.gate = (
+            ReleaseGate(self.id, resolved.get("min_runtime_minutes", 0))
+            if self.gates_release
+            else None
+        )
+        self.max_price_eur_per_wh = self._price_cap(resolved, "max_price_ct_kwh")
+
+        self.last_plan = []
+        self.last_slot_capacity_wh = 0.0
+        # The permanent draw the meter showed while the appliance was idle, in watts.
+        # The standby forecast keeps the last measured figure while the appliance runs,
+        # because "what it draws when it is doing nothing" does not change with the
+        # compressor being on. None until a cycle has seen an idle reading.
+        self.last_standby_w = None
+        # Per slot: could the load have paid for it? Ranks the blockers honestly.
+        self.last_affordable = []
+        # When a schedule last arrived from outside, and when this load first started
+        # waiting for one. A gate that is only ever settled by someone else freezes the
+        # moment they stop answering - but a load that has never been scheduled is not
+        # stale, it is new, and falling back on its first cycle would put it into the
+        # household forecast *and* offer it to the solver at the same time.
+        self.last_schedule_at = None
+        self.waiting_for_schedule_since = None
+        # Whether the fallback planner currently owns the placement - i.e. the last
+        # schedule is older than the manager's staleness age and this load has been
+        # handed back to this module's own plan. The cycle sets it when the schedule
+        # goes stale; `schedulable()` takes it back the moment a solver asks, because
+        # a solver that asks is a solver that is alive.
+        self.fallback_active = False
+        # When this load was last handed to a solver as something to place. The answer
+        # to that offer settles whether the fallback stays gone or comes straight back,
+        # so the manager has to be able to tell "was never offered" from "offered and
+        # not answered for".
+        self.offered_at = None
+        # Whether the reported price was measured against a run without this load, or
+        # is only the tariff of the hours it occupies.
+        self.last_cost_is_measured = False
+        self.last_cost_is_shared = False
+        self.last_demand = None
+        self.last_release = None
+        self.last_error = None
+
+    def _price_cap(self, entry, key):
+        """ct/kWh is what a user can reason about; the planner wants EUR/Wh."""
+        raw = entry.get(key)
+        if raw in (None, "", 0):
+            return None
+        try:
+            return float(raw) / 100.0 / 1000.0
+        except (TypeError, ValueError):
+            logger.warning(
+                "[LOADS] '%s' has an unreadable %s %r - ignoring that limit",
+                self.id, key, raw,
+            )
+            return None
+
+    @property
+    def subtracted_sensor(self):
+        """
+        The meter whose history has to leave the household base load, or "".
+
+        One question, two fields: a heated store names the appliance it measures, an
+        externally fed load names the meter its forecast replaces. Resolving it here
+        keeps the manager from having to know which type it is holding.
+
+        An EVCC loadpoint series is never returned: EVCC meters its home as the site
+        balance minus every loadpoint, so that history is not inside the base load
+        a `group:home` profile is built from, and asking for its subtraction can
+        only trip the household-smaller-than-controllables guard - the appliance
+        is counted once, by the loadpoint series, and the guard said nothing was
+        subtracted while claiming the opposite. A load whose base load is built
+        from elsewhere (a home automation meter that does carry the appliance) is
+        the case `subtract_from_base_load` exists for, so every other name still
+        returns as before - the load interface keeps deciding what the sensor
+        names, and with it which connection answers it.
+        """
+        if not self.subtract_from_base_load:
+            return ""
+        if is_evcc_loadpoint_series(self.power_sensor):
+            return ""
+        if self.type in EXTERNAL_TYPES:
+            # Falling back to the old field name is not tidiness, it is the safety net
+            # under the rename. The store migration only reaches a config it has
+            # already seen: a backup restored afterwards, or a hand-written YAML, can
+            # still arrive carrying `power_sensor` on an external load, and silently
+            # not subtracting it would double-count the appliance with nothing said.
+            return self.replaces_sensor or self.power_sensor
+        return self.power_sensor
+
+    def metered_out_of_base_load(self):
+        """
+        Whether this appliance's meter stands outside the household base load.
+
+        Two ways to arrive there, and both leave the meter's permanent draw with
+        nowhere to be counted: a subtracted meter is taken out of the household
+        history wholesale, and an EVCC loadpoint series was never inside `group:home`
+        to begin with - EVCC nets every loadpoint off the site balance it meters home
+        from. Anything the model measures below the standby threshold is added to the
+        household forecast so it is not lost; a load whose meter is part of the base
+        load (subtract off, ordinary sensor) needs none of that.
+        """
+        return bool(self.subtracted_sensor) or is_evcc_loadpoint_series(self.power_sensor)
+
+    def schedule_is_stale(self, now, max_age_seconds):
+        """
+        Whether nobody has scheduled this load recently enough to be trusted.
+
+        The release signal is only refreshed when a schedule arrives, so an optimizer
+        that stops answering would otherwise leave the appliance latched on whatever it
+        was last told - a pump held released indefinitely, with nothing logging why.
+        """
+        since = self.last_schedule_at or self.waiting_for_schedule_since
+        if since is None:
+            return False
+        return (now - since).total_seconds() > max_age_seconds
+
+    def offers_demand(self):
+        """
+        Whether this load currently has anything for an optimizer to place.
+
+        Mirrors the filter in ``ManagedLoadManager.schedulable``: a load with no energy
+        to deliver is never sent to the optimizer, so no schedule will ever come back
+        for it - and waiting for one is not a fault.
+        """
+        return _offerable(self.last_demand)
+
+    def kind_is_contingent(self):
+        """Whether this load's timing is ours to choose, rather than merely reported."""
+        return self.type in CONTINGENT_TYPES
+
+    def commitment(self, ctx):
+        """
+        Slots at the head of the horizon the appliance is not free to change.
+
+        A plan is built from scratch every couple of minutes and knows nothing of the
+        one before it. Each plan on its own keeps its runs and its rests long enough,
+        but the appliance lives through a *sequence* of them, and the seam between two
+        is where it cycles: on a live pool the realised trace had six- and seven-minute
+        stops that no single plan ever contained - fifty-nine different plans in a day,
+        stitched together.
+
+        So the solver is told what the appliance is already doing. A run that has not
+        yet served its minimum keeps going; a rest that has not yet served its minimum
+        is not interrupted. Returns ``(on_slots, off_slots)``, at most one non-zero.
+
+        Only the *minimum* is held here. Whether a run is under way at all is
+        `is_running`, and the two must stay apart - see the note there.
+        """
+        if self.gate is None:
+            return 0, 0
+        minutes = float(self.config.get("min_runtime_minutes", 0) or 0)
+        per_slot = ctx.time_frame_base / 60.0
+
+        def remaining(since):
+            if since is None or minutes <= 0:
+                return 0
+            left = minutes - (ctx.now - since).total_seconds() / 60.0
+            return max(0, math.ceil(left / per_slot)) if left > 0 else 0
+
+        if self.gate.released:
+            return remaining(self.gate.released_since), 0
+        return 0, remaining(self.gate.blocked_since)
+
+    def is_running(self, ctx=None):          # pylint: disable=unused-argument
+        """
+        Whether the appliance is drawing right now, for the solver's benefit only.
+
+        Deliberately *not* folded into `commitment`. Holding a slot and knowing a run
+        is under way are different things, and binding them together latches: pinning
+        the head slot keeps the gate released, which pins it again on the next cycle,
+        so the load can never stop while it has demand and the slot is allowed. On a
+        live pool that ran it straight through an evening peak into the single dearest
+        slot of the day - 34.65 ct against a 30 ct limit - placing exactly the same
+        energy it would have placed anyway.
+
+        What the solver actually needs is the cheaper truth: a run already under way
+        costs nothing to continue, where stopping and restarting costs a start. That
+        breaks the tie toward continuing and still yields when stopping is worth real
+        money.
+        """
+        return bool(self.gate is not None and self.gate.released)
+
+    def max_slots_per_day(self, ctx):
+        """
+        The daily runtime cap in slots, 0 for none.
+
+        Same figure the fallback planner works from, so the two agree whichever one
+        ends up placing the load.
+        """
+        hours = float(self.config.get("max_runtime_hours_per_day", 0) or 0)
+        return int(hours * ctx.slots_per_hour()) if hours > 0 else 0
+
+    def min_runtime_slots(self, ctx):
+        """The configured minimum run, in slots at the running resolution."""
+        minutes = float(self.config.get("min_runtime_minutes", 0) or 0)
+        return max(1, int(round(minutes * 60 / ctx.time_frame_base)))
+
+    def _resolved_options(self, ctx):
+        """Turn the minute- and hour-based config into slot counts for this resolution."""
+        return PlanOptions(
+            strategy=self.config.get("strategy"),
+            min_runtime_slots=self.min_runtime_slots(ctx),
+            max_slots_per_day=self.max_slots_per_day(ctx),
+            max_price_eur_per_wh=self.max_price_eur_per_wh,
+        )
+
+    def reconfigure(self, entry):
+        """
+        Apply a changed configuration in place.
+
+        The model keeps whatever it has learned - a target temperature change should not
+        cost a fortnight of calibration - and the gate keeps its current release, so a
+        running compressor is not interrupted by someone adjusting an unrelated field.
+        Restart-required settings (id, type, sensors, physical dimensions) never reach
+        here; the schema labels them and the UI shows the restart banner instead.
+        """
+        resolved = apply_defaults(entry)
+        self.config = resolved
+        self.enabled = bool(resolved.get("enabled", True))
+        self.priority = int(resolved.get("priority", 100) or 100)
+        self.exclusive_group = str(resolved.get("exclusive_group", "") or "").strip()
+        self.max_price_eur_per_wh = self._price_cap(resolved, "max_price_ct_kwh")
+
+        if self.gate is not None:
+            self.gate.min_runtime_minutes = max(
+                0, int(resolved.get("min_runtime_minutes", 0) or 0)
+            )
+        if self.model is not None:
+            self.model.reconfigure(resolved)
+
+    # -- the cycle ------------------------------------------------------------------------
+
+    def evaluate(self, ctx, budget_wh=None, defer_gate=False):
+        """
+        Run one planning cycle.
+
+        Returns ``(contribution, release)``. *release* is None for profile-kind loads,
+        which have nothing to gate. Exceptions from a model are caught and reported on
+        the instance rather than propagated: this runs on the path that builds the
+        optimizer request, and one misconfigured sauna must not stop the house being
+        optimized.
+        """
+        if not self.enabled or self.model is None:
+            return None, None
+
+        try:
+            demand = self.model.demand(ctx)
+        except (ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
+            self.last_error = str(exc)
+            logger.exception("[LOADS] '%s' failed to compute its demand", self.id)
+            return None, None
+
+        self.last_error = None
+        if demand.kind != KIND_PROFILE:
+            demand.efficiency = self._efficiency(demand, ctx)
+        self.last_demand = demand
+
+        if demand.kind == KIND_PROFILE:
+            plan = list(demand.profile_wh or [0.0] * ctx.slot_count)
+            release = None
+        elif defer_gate and _offerable(demand):
+            # Somebody else is doing the placing. Plan anyway - it is what the load
+            # falls back to if no schedule arrives - but do not touch the gate: it
+            # remembers when it last released, so settling it against a plan that is
+            # about to be replaced would start a minimum-runtime hold on a decision
+            # nobody made.
+            self._mask_current_slot(demand, ctx, scheduled=True)
+            plan = self._plan_only(demand, ctx, budget_wh)
+            # The gate keeps whatever it last decided until a schedule arrives. Nulling
+            # it left the card reporting a bare gate state - no energy figure, no next
+            # start - for every cycle that landed between two optimizer runs.
+            release = self.last_release
+        else:
+            plan, release = self._plan_and_gate(demand, ctx, budget_wh)
+
+        # Only the planner that is actually placing this load publishes. This used to
+        # store the fallback's placement every cycle, while the optimizer wrote its own
+        # over the top a minute later: the two alternated in the same field, so the
+        # card, the API and the summary flipped between them for as long as the load
+        # was scheduled. On a live pool that read as 21 slots and 8.4 kWh appearing and
+        # vanishing every couple of minutes with the inputs unchanged.
+        # A load with nothing to place is not handed to the optimizer, so it settles its
+        # own gate (above) and publishes its own, empty plan here. Keeping the deferred
+        # branch for it latched the gate on the optimizer's last answer - an appliance
+        # left released after its demand was gone, until the staleness fallback fired.
+        deferred = defer_gate and _offerable(demand)
+        if not (deferred and self.last_schedule_at is not None):
+            self.last_plan = plan
+        self.last_release = release
+
+        if not any(plan):
+            return None, release
+
+        return self._contribution(plan, ctx, demand), release
+
+    def _efficiency(self, demand, ctx):
+        """
+        The per-slot efficiency this load is configured to plan with, or [] for none.
+
+        The thermal model works out its own from its COP, and a push may carry one; the
+        outdoor-temperature rule needs neither and is applied here, so a load with no
+        model of its own can still prefer the warm hours. The setting decides which of
+        them counts: ``off`` discards anything a model or a sender supplied.
+        """
+        source = slot_efficiency.source_of(self.config)
+        if source == slot_efficiency.SOURCE_OFF:
+            return []
+        if source == slot_efficiency.SOURCE_AMBIENT:
+            return slot_efficiency.from_ambient(
+                ctx.outdoor_temp_c or ctx.ambient_temp_c,
+                ctx.slot_count,
+                start=ctx.current_slot,
+                feasible=demand.feasible or None,
+                per_k=self.config.get("efficiency_per_k", slot_efficiency.DEFAULT_PER_K),
+                reference=self.config.get(
+                    "efficiency_reference", slot_efficiency.REFERENCE_WARMEST
+                ),
+            )
+        values = list(demand.efficiency or [])
+        if not values:
+            return []
+        return [slot_efficiency.clamp(value) for value in values][: ctx.slot_count]
+
+    def delivered_wh(self, plan=None):
+        """What a plan delivers in units of the best slot - comparable to the demand."""
+        plan = self.last_plan if plan is None else plan
+        efficiency = self.last_demand.efficiency if self.last_demand else None
+        return slot_efficiency.effective_wh(plan, efficiency)
+
+    def adopt_schedule(self, schedule, ctx, cost=None):
+        """
+        Take a schedule somebody else produced, and gate on that instead.
+
+        The optimizer places this load against the household and the battery together,
+        which is a better answer than this module can reach on its own. What does not
+        change is that one series drives both the release signal and whatever is
+        reported - the two cannot disagree, because there is only ever one plan.
+        """
+        if self.last_demand is None or self.gate is None:
+            return None
+        plan = [max(0.0, float(value or 0.0)) for value in schedule]
+        if len(plan) < ctx.slot_count:
+            plan += [0.0] * (ctx.slot_count - len(plan))
+        self.last_plan = plan[: ctx.slot_count]
+        self.last_schedule_at = ctx.now
+        # What the household actually pays extra, where the optimizer measured it. The
+        # tariff of the occupied hours is the fallback, and only a rough guide: it
+        # cannot see that the energy came from the roof, so a sunny day reads dearer
+        # than a dark one.
+        measured = (cost or {}).get("eur_per_wh")
+        self.last_demand.plan_price_eur_per_wh = (
+            float(measured) if measured is not None
+            else plan_price(self.last_plan, list(ctx.price_eur_per_wh or []))
+        )
+        self.last_cost_is_measured = measured is not None
+        self._remember_affordable(ctx)
+        self.last_cost_is_shared = bool((cost or {}).get("shared"))
+        # The reasons have to describe this plan too. They came from the fallback
+        # planner, which had refused the very slots the optimizer went on to use.
+        self.last_demand.slot_reasons = reasons_for_schedule(
+            self.last_plan, self.last_demand, ctx
+        )
+        self.last_release = self._gate_on(
+            self.last_demand, ctx, self.last_plan, scheduled=True
+        )
+        return self.last_release
+
+    @staticmethod
+    def _active(demand, scheduled=False):
+        """
+        Whether the load may run now at all.
+
+        A store planned by temperature is free to run anywhere below its storage
+        ceiling once a solver is following it - inside the band the plan decides, and
+        the deadband that keeps a self-planned store from hunting would only veto the
+        heat the solver chose to bank. Planned by anything else, the deadband stands.
+        """
+        if scheduled and demand.store is not None:
+            return bool(demand.detail.get("storage_active", True))
+        return bool(demand.detail.get("active", demand.total_wh > 0))
+
+    def _plan_only(self, demand, ctx, budget_wh):
+        """The placement, without settling the gate on it."""
+        options = self._resolved_options(ctx)
+        self.last_slot_capacity_wh = demand.max_power_w * ctx.hours_per_slot()
+        # Whichever planner ends up placing this load, the summary answers the same
+        # question and needs the same footing.
+        self._remember_affordable(ctx)
+        return plan_contingent(demand, ctx, options, budget_wh=budget_wh)
+
+    def _gate_on(self, demand, ctx, plan, scheduled=False):
+        """Turn a placement into a release decision."""
+        active = self._active(demand, scheduled)
+        planned_now = (
+            0 <= ctx.current_slot < len(plan) and plan[ctx.current_slot] > 0
+        )
+        release = self.gate.evaluate(
+            planned=planned_now,
+            urgent=demand.urgent,
+            now=ctx.now,
+            has_demand=active,
+        )
+        release["next_release_start"] = self._next_release_start(plan, ctx)
+        release["energy_needed_wh"] = round(demand.total_wh, 1)
+        return release
+
+    def _mask_current_slot(self, demand, ctx, scheduled=False):
+        """
+        A load that must not start right now must not be *forecast* to start now either.
+
+        Marking the current slot infeasible before anything is placed is what keeps the
+        array the optimizer works from and the signal sent to the appliance in
+        agreement. It belongs here rather than inside the planner because the same mask
+        is handed out when something else does the placing.
+        """
+        active = self._active(demand, scheduled)
+        feasible = list(demand.feasible) or [True] * ctx.slot_count
+        if not active and 0 <= ctx.current_slot < len(feasible):
+            feasible[ctx.current_slot] = False
+        demand.feasible = feasible
+
+    def _plan_and_gate(self, demand, ctx, budget_wh):
+        """Place the contingent, then decide whether that means "run now"."""
+        self._mask_current_slot(demand, ctx)
+        plan = self._plan_only(demand, ctx, budget_wh)
+        return plan, self._gate_on(demand, ctx, plan)
+
+    def _next_release_start(self, plan, ctx):
+        """When the appliance is next expected to run, as an ISO timestamp."""
+        for index in range(max(0, ctx.current_slot), len(plan)):
+            if plan[index] > 0:
+                start = ctx.anchor + timedelta(seconds=index * ctx.time_frame_base)
+                return start.isoformat()
+        return None
+
+    def _contribution(self, plan, ctx, demand):
+        source = SOURCE_INTERNAL
+        if self.type in EXTERNAL_TYPES:
+            source = getattr(self.model, "last_source", SOURCE_API)
+        return LoadContribution(
+            id=self.id,
+            slots_wh=plan,
+            anchor=ctx.anchor,
+            time_frame_base=ctx.time_frame_base,
+            valid_until=ctx.now + self.internal_ttl(),
+            kind=demand.kind,
+            source=source,
+        )
+
+    def internal_ttl(self):
+        """
+        How long a contribution computed internally stays valid.
+
+        Long enough to survive a skipped cycle, short enough that a wedged poll thread
+        stops inflating the forecast instead of holding a stale demand there for a day.
+        """
+        return timedelta(minutes=max(
+            _INTERNAL_TTL_MIN_MINUTES,
+            _INTERNAL_TTL_CYCLES * self.cycle_seconds // 60,
+        ))
+
+    def standby_forecast_active(self):
+        """
+        Whether this load's standby draw is riding the household forecast.
+
+        Same rule the manager publishes under - a threshold, a model that can measure
+        it, and a meter that stands outside the household base load. Reported so the
+        status page can show the term and where it is counted, without the manager
+        having to hand its registry over.
+        """
+        model = getattr(self, "model", None)
+        return bool(
+            model is not None
+            and getattr(model, "standby_threshold_w", 0) > 0
+            and hasattr(model, "standby_power_now")
+            and self.metered_out_of_base_load()
+        )
+
+    # -- external control -----------------------------------------------------------------
+
+    def accept_push(self, parsed, anchor, time_frame_base, source=SOURCE_API):
+        """Hand a parsed push to the model. Only external types accept one."""
+        if not hasattr(self.model, "accept"):
+            raise ValueError(
+                f"managed load '{self.id}' is of type '{self.type}' and computes its "
+                "own demand - it does not accept pushed data"
+            )
+        self.model.accept(parsed, anchor, time_frame_base)
+        # Carried through as given. Collapsing anything that was not MQTT into "api"
+        # reported a profile EOS Connect fetched itself as one somebody had pushed,
+        # which sends a user chasing an automation that was never involved.
+        self.model.last_source = (
+            source if source in (SOURCE_API, SOURCE_MQTT, SOURCE_PULL) else SOURCE_API
+        )
+
+    def clear_push(self):
+        """Drop the stored push. Only external types have one to drop."""
+        if hasattr(self.model, "clear"):
+            self.model.clear()
+            return True
+        return False
+
+    def set_override(self, mode, minutes, now):
+        """Force this load released or blocked. Profile-kind loads have no gate."""
+        if self.gate is None:
+            raise OverrideNotSupported(
+                f"managed load '{self.id}' has no release signal to override"
+            )
+        self.gate.set_override(mode, minutes, now)
+
+    def observe(self, sample):
+        """Feed one recorded sample to the model's calibration, if it has any."""
+        if self.model is None:
+            return False
+        return bool(self.model.observe(sample))
+
+    def _remember_affordable(self, ctx):
+        """
+        Which slots the load could pay for, whatever else is blocking them.
+
+        Needed to answer "what is holding this back?" honestly. A slot excluded for
+        being too cold is only worth reporting if the load could have afforded it -
+        and on a day where every overnight hour is dearer than the limit, relaxing the
+        cold cut-off frees nothing at all.
+
+        Sun counts: a slot the roof covers is affordable whatever the tariff says,
+        which is why the optimizer takes 30 ct slots in the middle of a sunny
+        afternoon.
+        """
+        cap = self.max_price_eur_per_wh
+        prices = list(ctx.price_eur_per_wh or [])
+        surplus = list(ctx.pv_surplus_wh or [])
+        draw = self.last_slot_capacity_wh or 0.0
+
+        worth = []
+        for index in range(ctx.slot_count):
+            if cap is None:
+                worth.append(True)
+                continue
+            covered = index < len(surplus) and surplus[index] >= draw > 0
+            priced = index < len(prices) and prices[index] <= cap
+            worth.append(bool(covered or priced))
+        self.last_affordable = worth
+
+    # -- reporting ------------------------------------------------------------------------
+
+    def plan_summary(self):
+        """
+        What became of every slot, and which setting is holding the load back.
+
+        A shortfall used to be reported as "widen its window or raise the daily cap",
+        which is wrong advice whenever something else did the excluding - a price cap
+        can rule out four fifths of a horizon while the window stands wide open.
+        """
+        reasons = (self.last_demand.slot_reasons if self.last_demand else None) or []
+        if not reasons:
+            return None
+
+        counts = {}
+        for reason in reasons:
+            counts[reason] = counts.get(reason, 0) + 1
+
+        # Only a shortfall has something holding it back. A slot can be skipped for the
+        # daily cap and the demand still be met the next day, and reporting that as a
+        # limit would send the user to loosen a setting that cost them nothing.
+        needed = self.last_demand.total_wh
+        covered = self.delivered_wh() >= needed - 1.0
+
+        # Ranked by the slots relaxing it would actually free, not by how many it
+        # excluded. On a live pool 56 slots were "too cold to run" and every one of
+        # them was also dearer than the limit, so the card sent its owner to lower the
+        # cold cut-off - which would have run the pump in freezing air and gained
+        # nothing. The price cap was what cost them the 35 kWh.
+        affordable = self.last_affordable or []
+        usable = {}
+        for index, reason in enumerate(reasons):
+            if reason in NON_BLOCKING_REASONS:
+                continue
+            if index < len(affordable) and not affordable[index]:
+                continue
+            usable[reason] = usable.get(reason, 0) + 1
+
+        # Price competes on the same footing, carrying every blocked slot the load
+        # could not have paid for - whichever rule matched first owns a slot, so a
+        # cold night hides the fact that it was also dear and the cap would otherwise
+        # never appear at all. Letting them rank together stops one affordable slot
+        # behind some other rule outvoting a hundred unaffordable ones: a pool short
+        # of 45 kWh was told it was limited by a single slot that "costs more than it
+        # is worth".
+        unaffordable = sum(
+            1 for index, reason in enumerate(reasons)
+            if reason not in NON_BLOCKING_REASONS
+            and index < len(affordable) and not affordable[index]
+        )
+        candidates = [(count, reason) for reason, count in usable.items() if count]
+        if unaffordable:
+            candidates.append((unaffordable, SLOT_PRICE))
+        blocking = [] if covered else candidates
+        if not covered and not blocking:
+            blocking = [
+                (count, reason) for reason, count in counts.items()
+                if reason not in NON_BLOCKING_REASONS and count
+            ]
+        blocking.sort(reverse=True)
+
+        # What the appliance could deliver if every limit were lifted at once - every
+        # slot still ahead of it, running flat out. When the demand is above even that,
+        # naming the setting that excluded the most slots is true and useless: the user
+        # raises it, and the load still cannot keep up. On a real pool the standing
+        # losses grew until 36 kWh was wanted from a horizon that could carry 29, and
+        # the card sent its owner to the price cap.
+        reachable = sum(
+            1 for reason in reasons if reason not in (SLOT_PAST, SLOT_DEADLINE)
+        )
+        reachable_wh = reachable * self.last_slot_capacity_wh
+        over_committed = bool(blocking) and needed > reachable_wh + 1.0
+
+        return {
+            "slots": len(reasons),
+            "planned": counts.get(SLOT_PLANNED, 0),
+            "counts": counts,
+            # The one worth naming to the user; None when nothing was in the way.
+            "limited_by": blocking[0][1] if blocking else None,
+            "limited_slots": blocking[0][0] if blocking else 0,
+            # What the plan came to per kWh. Under a budget the pump can legitimately
+            # run in the day's dearest hour, which looks wrong until this number is
+            # next to it.
+            "avg_price_ct_kwh": _as_ct_per_kwh(
+                self.last_demand.plan_price_eur_per_wh if self.last_demand else None
+            ),
+            # What that figure is: what the household pays extra for this load, or
+            # merely the tariff of the hours it runs in. They differ most on the sunny
+            # days people care about, so the card must not present one as the other.
+            "price_is_measured": self.last_cost_is_measured,
+            "price_is_shared": self.last_cost_is_shared,
+            # Set when no setting can close the gap, so the card stops naming one.
+            "over_committed": over_committed,
+            "reachable_wh": round(reachable_wh, 1),
+            "shortfall_wh": round(max(0.0, needed - self.delivered_wh()), 1),
+        }
+
+    def status(self):
+        """Everything the REST API and the dashboard show for this instance."""
+        demand = self.last_demand
+        payload = {
+            "id": self.id,
+            "type": self.type,
+            "enabled": self.enabled,
+            "priority": self.priority,
+            "kind": demand.kind if demand else None,
+            "reason": demand.reason if demand else None,
+            "energy_needed_wh": round(demand.total_wh, 1) if demand else 0.0,
+            "planned_wh": round(sum(self.last_plan), 1) if self.last_plan else 0.0,
+            "plan": [round(value, 1) for value in self.last_plan],
+            # Who placed this plan: the optimizer while its answers keep arriving, the
+            # fallback once its silence has outlasted the staleness age. Read "who is
+            # the planner", not a quality judgement.
+            "fallback_active": self.fallback_active,
+            # The permanent draw the meter shows while the appliance is on standby, and
+            # whether that draw is riding the household forecast beside this load's
+            # plan. Both None when no threshold is set: then it is simply household.
+            "standby_w": (
+                round(self.last_standby_w, 1)
+                if self.last_standby_w is not None and self.standby_forecast_active()
+                else None
+            ),
+            "error": self.last_error,
+            "model": self.model.status() if self.model else {},
+        }
+        if demand:
+            payload["detail"] = demand.detail
+            payload["plan_reasons"] = list(demand.slot_reasons or [])
+        summary = self.plan_summary()
+        if summary:
+            payload["plan_summary"] = summary
+        if self.gate is not None:
+            payload["release"] = self.last_release or self.gate.status()
+        return payload

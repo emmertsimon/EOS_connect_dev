@@ -1,0 +1,12 @@
+configuration:
+  time_zone:
+    name: Time Zone
+    description: Default time zone.
+
+  eos_connect_web_port:
+    name: EOS Connect Web Port
+    description: "Port for EOS Connect web server (default: 8081)."
+
+  log_level:
+    name: Log Level
+    description: "Log level: debug, info, warning, error."
