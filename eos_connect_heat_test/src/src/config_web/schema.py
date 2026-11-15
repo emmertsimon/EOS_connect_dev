@@ -955,12 +955,12 @@ _ALL_FIELDS: list[FieldDef] = [
         section="eos",
         level="expert",
         description=(
-            "Plan a charging curve that bends upward (a hard drop at the top followed "
-            "by a long tail) exactly instead of along its envelope. More accurate near "
-            "full, but every slot that reaches the top costs the solver extra binaries "
-            "- solves take seconds instead of a fraction of one, capped at four times "
-            "the plain solve (at least 5 s). A curve that only gets steeper towards "
-            "full is planned exactly either way"
+            "Plan the charging curve inside the solver, at each slot's average state "
+            "of charge, instead of adjusting per-slot limits around it. Exact for "
+            "curves with a hard knee (e.g. full power to 90 %, then a steep drop), "
+            "which the default reads at the start of each slot and can overrate by "
+            "the whole drop. Slots that reach the top cost extra binaries; the extra "
+            "solving is capped at four times the plain solve (at least 5 s)"
         ),
         labels=["restart_required"],
         help_url="config-battery.html#charging-curve",
@@ -1538,7 +1538,11 @@ _ALL_FIELDS: list[FieldDef] = [
         default=True,
         section="battery",
         level="standard",
-        description="Enable charging curve for controlled charging power according to SOC",
+        description=(
+            "Reduce the charge power as the battery fills, by SOC and battery "
+            "temperature. Always limits real charging; the built-in optimizer "
+            "(local_evopt) also plans with it. Never limits discharging"
+        ),
         labels=["restart_required"],
         help_url="config-battery.html#charging-curve",
         display_group="Charging",
@@ -1550,12 +1554,12 @@ _ALL_FIELDS: list[FieldDef] = [
         section="battery",
         level="standard",
         description=(
-            "Your battery's charging curve as SOC:power points, e.g. "
-            "'0:6000, 90:6000, 95:3000, 100:800' (power in W, or in % of the maximum "
-            "charge power: '90:100%, 100:15%'). Interpolated in between and held flat "
-            "outside. Used for the live charge limit and, with the built-in optimizer, "
-            "for every slot of the plan. Empty = built-in curve (full power to 50 %, "
-            "then a steady taper)"
+            "Your battery's own charging curve as SOC:power points, e.g. "
+            "'0:6000, 90:6000, 95:3000, 100:800' (power in W, kW, or in % of the "
+            "maximum charge power: '90:100%, 100:15%'). Interpolated in between and "
+            "held flat outside. Used for the live charge limit and, with the built-in "
+            "optimizer, for the plan. Empty = built-in curve (full power to 50 %, then "
+            "a steady taper)"
         ),
         labels=["restart_required"],
         help_url="config-battery.html#charging-curve",
@@ -1694,7 +1698,11 @@ _ALL_FIELDS: list[FieldDef] = [
         default="",
         section="battery",
         level="standard",
-        description="Sensor for load power in W. EVCC supplies its household history",
+        description=(
+            "Sensor for total household load in W, wallbox and managed loads "
+            "included — the same balance point PV and grid are measured at. "
+            "EVCC supplies its household history"
+        ),
         labels=["restart_required", "evcc_managed"],
         help_url="config-battery.html#battery-price",
         depends_on={"battery.price_calculation_enabled": [True]},
@@ -1706,7 +1714,10 @@ _ALL_FIELDS: list[FieldDef] = [
         default="",
         section="battery",
         level="standard",
-        description="Sensor for electricity price. EVCC supplies its persisted tariff slots",
+        description=(
+            "Sensor for the current grid import price, not a forecast. EVCC "
+            "supplies its persisted tariff slots"
+        ),
         labels=["restart_required", "evcc_managed"],
         help_url="config-battery.html#battery-price",
         depends_on={"battery.price_calculation_enabled": [True]},

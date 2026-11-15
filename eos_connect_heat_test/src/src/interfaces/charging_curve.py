@@ -7,14 +7,15 @@ as the cells fill. EOS Connect knows that in two places, and both have to agree:
 - the live limit written to the inverter for the slot that is running, and
 - the plan, which decides how much the battery can still absorb in each slot ahead.
 
-The curve is either the built-in formula (full power to 50 %, then a quadratic taper
-to 0.05 C) or a list of points the user enters - state of charge against power,
-interpolated linearly in between. Points are what a real battery needs: a pack that
-holds full power to 90 % and then drops hard is not something a single formula can
-describe, and neither is one that also tapers at the bottom.
+Both read it through ``BatteryInterface.charge_power_limit_w``. The curve is either
+the built-in formula there (full power to 50 %, then a quadratic taper to 0.05 C) or
+a list of points the user enters - state of charge against power, interpolated
+linearly in between. Points are what a real battery needs: a pack that holds full
+power to 90 % and then drops hard is not something a single formula can describe,
+and neither is one that also tapers at the bottom.
 
-Everything here is a pure function on plain numbers so the battery interface, the
-config validation and the optimizer backend all read the same curve.
+Everything here is a pure function on plain numbers so the battery interface and the
+config validation read the points the same way.
 """
 
 import itertools
@@ -26,12 +27,6 @@ CURVE_FORMAT_HELP = (
     "charge power - e.g. '0:6000, 90:6000, 95:3000, 100:800' or "
     "'0:100%, 90:100%, 95:50%, 100:10%'"
 )
-
-# The built-in formula is sampled at these SOCs when the plan needs it as points.
-# Below 50 % it is flat, so one point at 0 % carries that part.
-_BUILTIN_SAMPLE_SOCS = (0.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0,
-                        95.0, 100.0)
-_BUILTIN_MIN_C_RATE = 0.05
 
 _POINT_RE = re.compile(
     r"^\s*(?P<soc>[+-]?\d+(?:[.,]\d+)?)\s*%?\s*[:=]\s*"
@@ -144,32 +139,6 @@ def curve_power_at(points, soc_percent):
         if soc <= s1:
             return float(p0 + (p1 - p0) * (soc - s0) / (s1 - s0))
     return float(points[-1][1])
-
-
-def builtin_power_at(soc_percent, max_charge_power_w, capacity_wh):
-    """
-    The built-in curve: full power up to 50 %, then a quadratic taper to 0.05 C.
-
-    This is the formula EOS Connect has always used; it lives here so the live limit
-    and the plan cannot drift apart.
-    """
-    if capacity_wh <= 0:
-        return float(max_charge_power_w)
-    max_c_rate = float(max_charge_power_w) / float(capacity_wh)
-    soc = float(soc_percent)
-    if soc <= 50:
-        c_rate = max_c_rate
-    else:
-        c_rate = max(_BUILTIN_MIN_C_RATE, max_c_rate * (1 - (soc - 50) / 60) ** 2)
-    return min(c_rate * capacity_wh, float(max_charge_power_w))
-
-
-def builtin_curve_points(max_charge_power_w, capacity_wh):
-    """The built-in formula sampled as points, for consumers that need a curve."""
-    return [
-        (soc, builtin_power_at(soc, max_charge_power_w, capacity_wh))
-        for soc in _BUILTIN_SAMPLE_SOCS
-    ]
 
 
 def concave_envelope(points):
@@ -337,6 +306,9 @@ def _support_line(inside, grid, truth):
         )
         if best is None or lost < best[0]:
             best = (lost, (s0, p0, slope))
+    if best is None:  # cannot happen - the flat line through the lowest point fits
+        low_soc, low_power = min(inside, key=lambda point: point[1])
+        return [(low_soc, low_power, 0.0)]
     return [best[1]]
 
 

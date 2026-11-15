@@ -42,13 +42,7 @@ import time
 from datetime import datetime
 import requests
 from .battery_price_handler import BatteryPriceHandler
-from .charging_curve import (
-    ChargingCurveError,
-    builtin_curve_points,
-    builtin_power_at,
-    curve_power_at,
-    parse_curve_points,
-)
+from .charging_curve import ChargingCurveError, curve_power_at, parse_curve_points
 from .evcc_entities import connection_for, connections_from_section
 from .state_source import SUPPORTED_SOURCES, fetch_remote_state
 
@@ -643,63 +637,6 @@ class BatteryInterface:
             max_soc = self.battery_data.get("max_soc_percentage", 100)
         self.max_soc_set = max_soc
 
-    def __parse_charging_curve_points(self):
-        """
-        Read ``charging_curve_points`` once; a broken value falls back to the formula.
-
-        The config API refuses a value that does not parse, so this only meets one
-        written some other way (a hand-edited file, an old backup). Falling back is
-        safer than refusing to start: the built-in curve is conservative.
-        """
-        raw = self.battery_data.get("charging_curve_points", "")
-        try:
-            points = parse_curve_points(raw, self.max_charge_power_fix)
-        except ChargingCurveError as exc:
-            logger.warning(
-                "[BATTERY-IF] charging_curve_points ignored (%s) - using the built-in "
-                "charging curve instead | Config: #battery | ACTION REQUIRED",
-                exc,
-            )
-            return []
-        if points:
-            logger.info(
-                "[BATTERY-IF] Charging curve from %d points: %s",
-                len(points),
-                ", ".join(f"{soc:g}%:{power:.0f}W" for soc, power in points),
-            )
-        return points
-
-    def __curve_power_at(self, soc):
-        """Charge power of the active curve at *soc*, before temperature derating."""
-        if self.charging_curve_points:
-            return curve_power_at(self.charging_curve_points, soc)
-        return builtin_power_at(
-            soc, self.max_charge_power_fix, self.battery_data.get("capacity_wh", 0)
-        )
-
-    def get_charge_curve_for_planning(self):
-        """
-        The charging curve as ``[(soc_percent, power_w), ...]`` for the optimizer.
-
-        The same curve the live limit is taken from, derated by the current battery
-        temperature - the plan has no temperature forecast, and the next hours are
-        far more likely to look like now than like anything else. ``None`` when the
-        curve is switched off: the plan then uses the fixed maximum throughout.
-        """
-        if not self.battery_data.get("charging_curve_enabled", True):
-            return None
-        if self.charging_curve_points:
-            points = list(self.charging_curve_points)
-        else:
-            points = builtin_curve_points(
-                self.max_charge_power_fix, self.battery_data.get("capacity_wh", 0)
-            )
-        multiplier = self.__calculate_temp_multiplier(self.current_temp)
-        return [
-            (soc, min(power * multiplier, float(self.max_charge_power_fix)))
-            for soc, power in points
-        ]
-
     def __calculate_temp_multiplier(self, temp):
         """
         Calculate temperature compensation multiplier using a generic thermal derating curve
@@ -760,6 +697,119 @@ class BatteryInterface:
             # Shutdown above 60°C - overheat protection
             return 0.0
 
+    def __parse_charging_curve_points(self):
+        """
+        Read ``charging_curve_points`` once; a broken value falls back to the formula.
+
+        The config API refuses a value that does not parse, so this only meets one
+        written some other way (a hand-edited file, an old backup). Falling back is
+        safer than refusing to start: the built-in curve is conservative.
+        """
+        raw = self.battery_data.get("charging_curve_points", "")
+        try:
+            points = parse_curve_points(raw, self.max_charge_power_fix)
+        except ChargingCurveError as exc:
+            logger.warning(
+                "[BATTERY-IF] charging_curve_points ignored (%s) - using the built-in "
+                "charging curve instead | Config: #battery | ACTION REQUIRED",
+                exc,
+            )
+            return []
+        if points:
+            logger.info(
+                "[BATTERY-IF] Charging curve from %d points: %s",
+                len(points),
+                ", ".join(f"{soc:g}%:{power:.0f}W" for soc, power in points),
+            )
+        return points
+
+    def charge_power_limit_w(self, soc, temp=None, min_charge_power=500):
+        """
+        The charging curve: maximum charge power in W at a given SOC and temperature.
+
+        Pure calculation, no state is changed. The live limit
+        (``get_max_charge_power``) and the built-in optimizer's plan both use it, so
+        the two cannot drift apart.
+
+        - With ``charging_curve_points`` set, the power is interpolated between the
+          user's points (flat before the first and after the last). There is no
+          floor: the points say exactly what the battery takes, including less than
+          ``min_charge_power`` near full.
+        - Otherwise the built-in formula: up to 50 % SOC the full configured C-rate,
+          above it falling with ``(1 - (SOC - 50) / 60)**2`` down to 0.05 C, never
+          below ``min_charge_power``.
+        - The temperature multiplier scales the result (1.0 without a sensor).
+        - Capped at ``max_charge_power_w`` and rounded to 50 W.
+
+        Args:
+            soc (float): State of charge in percent, 0..100.
+            temp (float, optional): Battery temperature in °C; None = no sensor.
+            min_charge_power (float): Lower bound in W for the built-in formula.
+
+        Returns:
+            float: The charge power limit in W. ``min_charge_power`` if the SOC is out
+            of range, or - for the built-in formula - the capacity is not configured.
+        """
+        if soc < 0 or soc > 100:
+            return min_charge_power
+        if self.charging_curve_points:
+            power = curve_power_at(self.charging_curve_points, soc)
+            power *= self.__calculate_temp_multiplier(temp)
+            power = min(power, self.max_charge_power_fix)
+            return round(power / 50) * 50
+
+        battery_capacity_wh = self.battery_data.get("capacity_wh", 0)
+        if battery_capacity_wh <= 0:
+            return min_charge_power
+
+        max_c_rate = self.max_charge_power_fix / battery_capacity_wh
+        min_c_rate = 0.05
+        if soc <= 50:
+            c_rate_soc = max_c_rate
+        else:
+            c_rate_soc = max(min_c_rate, max_c_rate * (1 - (soc - 50) / 60) ** 2)
+
+        final_c_rate = c_rate_soc * self.__calculate_temp_multiplier(temp)
+
+        max_charge_power = final_c_rate * battery_capacity_wh
+        max_charge_power = min(max_charge_power, self.max_charge_power_fix)
+        max_charge_power = round(max_charge_power / 50) * 50
+        return max(max_charge_power, min_charge_power)
+
+    # The built-in formula is handed to an exact plan as points at these SOCs. Below
+    # 50 % it is flat, so one point at 0 % carries that part.
+    _BUILTIN_PLAN_SOCS = (0.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0,
+                          95.0, 100.0)
+
+    def charge_curve_for_planning(self):
+        """
+        The charging curve as a function of SOC alone, for the optimizer's plan.
+
+        The temperature is frozen at its current value: it cannot be forecast, and
+        across a 48 h horizon it moves little compared to the SOC.
+
+        Returns:
+            callable or None: ``soc_percent -> W``, or None when the curve is
+            disabled or the capacity is not configured - the plan then uses the
+            fixed ``max_charge_power_w``. The callable carries the curve as
+            ``.points`` too, ``[(soc_percent, W), ...]``.
+        """
+        if not self.battery_data.get("charging_curve_enabled", True):
+            return None
+        if self.battery_data.get("capacity_wh", 0) <= 0:
+            return None
+        temp = self.current_temp
+
+        def curve(soc):
+            return self.charge_power_limit_w(min(max(soc, 0), 100), temp)
+
+        # The same curve as points, for a solver that plans it inside the model
+        # (local_evopt_exact_charging_curve): the user's own SOCs, or the built-in
+        # formula sampled where it bends.
+        socs = [soc for soc, _ in self.charging_curve_points] or self._BUILTIN_PLAN_SOCS
+        curve.points = [(float(soc), float(curve(soc))) for soc in socs]
+        return curve
+
     def __get_max_charge_power_dyn(self, soc=None, temp=None, min_charge_power=500):
         """
         Calculates the maximum charge power dynamically based on SOC and temperature.
@@ -811,9 +861,7 @@ class BatteryInterface:
         if temp is None:
             temp = self.current_temp  # May be None if not configured
 
-        battery_capacity_wh = self.battery_data.get("capacity_wh", 0)
-
-        if battery_capacity_wh <= 0:
+        if self.battery_data.get("capacity_wh", 0) <= 0:
             logger.warning("[BATTERY-IF] Battery capacity not set or invalid.")
             self.max_charge_power_dyn = min_charge_power
             return
@@ -826,20 +874,8 @@ class BatteryInterface:
             self.max_charge_power_dyn = min_charge_power
             return
 
-        # SOC-dependent power: the user's points, or the built-in formula
-        curve_power = self.__curve_power_at(soc)
-
-        # Temperature compensation
+        max_charge_power = self.charge_power_limit_w(soc, temp, min_charge_power)
         temp_multiplier = self.__calculate_temp_multiplier(temp)
-
-        # Calculate power
-        max_charge_power = curve_power * temp_multiplier
-        max_charge_power = min(max_charge_power, self.max_charge_power_fix)
-        max_charge_power = round(max_charge_power / 50) * 50
-        # The floor protects the built-in formula's tail; a user's own points say
-        # exactly what the battery takes, including less than the floor near full.
-        if not self.charging_curve_points:
-            max_charge_power = max(max_charge_power, min_charge_power)
 
         # Update and notify if changed
         if max_charge_power != self.last_max_charge_power_dyn:

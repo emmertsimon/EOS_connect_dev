@@ -208,17 +208,17 @@ class OptimizationInterface:
         return bool(getattr(self.backend, "places_home_appliance", False))
 
     @property
-    def plans_charge_curve(self):
+    def plans_charging_curve(self):
         """
-        Whether the backend plans the battery's charging curve slot by slot.
+        Whether the backend plans with the battery's charging curve slot by slot.
 
-        Read through to the backend like the two above. Only the in-process solver
-        can: the EOS server and the external EVopt service take one fixed maximum.
+        Only the in-process solver can: EOS and EVopt take one charge limit for the
+        whole horizon, so they are sent the fixed maximum instead.
         """
-        return bool(getattr(self.backend, "plans_charge_curve", False))
+        return bool(getattr(self.backend, "plans_charging_curve", False))
 
     def optimize(self, eos_request, timeout=None, managed_loads=None,
-                 managed_load_budget_w=0.0, battery_charge_curve=None):
+                 managed_load_budget_w=0.0, charge_power_limit=None):
         """
         Main entry point for optimization.
         Accepts EOS-format request, returns EOS-format response.
@@ -230,20 +230,20 @@ class OptimizationInterface:
         validates what it is sent. *managed_load_budget_w* travels the same way: it
         belongs to the installation rather than to any one load.
 
-        *battery_charge_curve* is ``[(soc_percent, power_w), ...]`` - the charge power
-        the battery takes at each state of charge - and reaches only a backend that
-        plans it per slot (see :attr:`plans_charge_curve`).
+        *charge_power_limit* is the charging curve (``soc_percent -> W``) and reaches
+        only a backend that plans with it; the others get the fixed limit inside the
+        request.
         """
         if timeout is None:
             timeout = self.timeout
         self.last_eos_request = eos_request  # Store for dynamic override logic
-        kwargs = {}
+        extra = {}
         if managed_loads is not None and self.schedules_managed_loads:
-            kwargs["managed_loads"] = managed_loads
-            kwargs["managed_load_budget_w"] = managed_load_budget_w
-        if battery_charge_curve and self.plans_charge_curve:
-            kwargs["battery_charge_curve"] = battery_charge_curve
-        eos_response, avg_runtime = self.backend.optimize(eos_request, timeout, **kwargs)
+            extra["managed_loads"] = managed_loads
+            extra["managed_load_budget_w"] = managed_load_budget_w
+        if charge_power_limit is not None and self.plans_charging_curve:
+            extra["charge_power_limit"] = charge_power_limit
+        eos_response, avg_runtime = self.backend.optimize(eos_request, timeout, **extra)
         return eos_response, avg_runtime
 
     def examine_response_to_control_data(self, optimized_response_in):

@@ -1,1 +1,1 @@
-__version__ = "0.3.42.398-develop+pr368+curve+limit.a1f8ee0"
+__version__ = "0.3.42.400-develop+pr368+curve+limit.033178a"
