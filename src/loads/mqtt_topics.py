@@ -109,6 +109,15 @@ def _topics_for(manager, item):
         "device_class": "energy",
         "icon": "mdi:calendar-clock",
     }
+    # What the plan wants it to draw right now - the setpoint for a modulating
+    # appliance, which a release flag cannot carry.
+    topics[f"{base}/planned_power_w"] = {
+        "name": f"{label} Planned Power",
+        "unit": "W",
+        "type": "sensor",
+        "device_class": "power",
+        "icon": "mdi:speedometer",
+    }
 
     if item.type in THERMAL_TYPES:
         topics[f"{base}/standby_w"] = {
@@ -259,6 +268,9 @@ def build_values(manager):
         if demand is not None:
             values[f"{base}/energy_needed_wh"] = {"value": round(demand.total_wh, 1)}
             values[f"{base}/planned_wh"] = {"value": round(sum(item.last_plan), 1)}
+            planned_now = manager.planned_power_now_w(item)
+            if planned_now is not None:
+                values[f"{base}/planned_power_w"] = {"value": planned_now}
 
             detail = demand.detail or {}
             if item.type in THERMAL_TYPES:

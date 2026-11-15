@@ -28,6 +28,7 @@ from .. import efficiency as slot_efficiency
 from .base import KIND_CONTINGENT, BaseDemandModel, EnergyDemand
 from .calibration import IDLE_POWER_W, ThermalCalibrator
 from .cover_habit import OBSERVED_HOURS, CoverHabit
+from ..modulation import ModulationError, parse_modulation
 from .thermal_physics import (
     WH_PER_M3_PER_K,
     cop_at,
@@ -151,6 +152,19 @@ class ThermalStorageModel(BaseDemandModel):
         self.volume_m3 = float(config.get("volume_m3", 0) or 0)
         self.surface_m2 = float(config.get("surface_m2", 0) or 0)
         self.rated_power_w = float(config.get("rated_power_w", 0) or 0)
+        # A modulating heat pump: rated_power_w is then the most it draws, this the
+        # least, and `modulation` how its COP changes in between (loads.modulation).
+        self.min_power_w = max(0.0, float(config.get("min_power_w", 0) or 0))
+        if self.min_power_w >= self.rated_power_w:
+            self.min_power_w = 0.0
+        try:
+            self.modulation = parse_modulation(config.get("modulation_cop", ""))
+        except ModulationError as exc:
+            logger.warning(
+                "[LOADS] '%s': modulation_cop ignored (%s) | Config: #managed-loads | "
+                "ACTION REQUIRED", config.get("id", "?"), exc,
+            )
+            self.modulation = []
         self.deadband_k = max(0.0, float(config.get("deadband_k", 0.5) or 0.0))
         self.cover_loss_factor = float(config.get("cover_loss_factor", 1.0) or 1.0)
         # The permanent draw of the appliance's own systems - circulation pumps,
@@ -378,6 +392,8 @@ class ThermalStorageModel(BaseDemandModel):
             feasible=feasible,
             feasible_reason=feasible_reason,
             max_power_w=self.rated_power_w,
+            min_power_w=self.min_power_w,
+            modulation=list(self.modulation) if self.min_power_w > 0 else [],
             efficiency=efficiency,
             store=store,
             deadline_slot=deadline_slot,

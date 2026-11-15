@@ -175,3 +175,32 @@ def test_a_store_without_a_demand_waits_for_the_solver_it_was_offered_to(
     assert item.waiting_for_schedule_since is not None, (
         "offered to the solver but not waiting for it"
     )
+
+
+def test_a_modulating_heat_pump_hands_its_range_and_heat_lines_to_the_solver(
+    make_manager, installation
+):
+    manager = _house_manager(
+        make_manager, installation, rated_power_w=2800, min_power_w=300,
+        modulation_cop="400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74",
+    )
+    record = manager.schedulable()[0]
+    assert record["max_power_w"] == 2800 and record["min_power_w"] == 300
+    slopes = [slope for slope, _ in record["heat_lines"]]
+    assert slopes[0] == pytest.approx(1.0) and slopes == sorted(slopes, reverse=True)
+
+
+def test_a_fixed_heat_pump_hands_over_no_range(make_manager, installation):
+    record = _house_manager(make_manager, installation).schedulable()[0]
+    assert record["min_power_w"] == 0 and record["heat_lines"] == []
+
+
+def test_a_broken_modulation_curve_is_dropped_with_a_warning(make_manager, installation, caplog):
+    with caplog.at_level("WARNING"):
+        manager = _house_manager(
+            make_manager, installation, rated_power_w=2800, min_power_w=300,
+            modulation_cop="400-1.0",
+        )
+    record = manager.schedulable()[0]
+    assert record["min_power_w"] == 300 and record["heat_lines"] == []
+    assert "modulation_cop ignored" in caplog.text

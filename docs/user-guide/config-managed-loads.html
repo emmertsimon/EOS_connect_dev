@@ -564,6 +564,31 @@
                         is stopped whatever the plan says. Frost protection still releases it
                         immediately.</p>
 
+                    <h3 id="managed-loads-modulation">A heat pump that modulates</h3>
+                    <p>An inverter heat pump does not run at one power: it draws anything between its
+                        minimum and its maximum, and it does not deliver the same heat per watt across
+                        that range. At low modulation the lift is small and the COP at its best; at full
+                        power the flow runs hotter and every extra watt buys less heat. Planned at a single
+                        <code>rated_power_w</code>, a store is either filled too slowly on paper (the
+                        pump really ran at 2&nbsp;kW) or too quickly (it really idled along at 400&nbsp;W),
+                        and the battery and grid plan around it are off by the difference.</p>
+                    <p>Set <code>min_power_w</code> to the least the pump draws while running and
+                        <code>rated_power_w</code> to the most. The built-in optimizer then picks a power in
+                        between for every slot it runs. <code>modulation_cop</code> describes how the
+                        efficiency changes with it, as <code>W:factor</code> points on the COP the model
+                        already works out from the air temperature &mdash; for example
+                        <code>400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74</code>. Measured
+                        values are best: the heat counter of the pump (EMS-ESP, Modbus) against its
+                        electrical power over a few runs at different powers. Without it every watt counts
+                        the same, and the plan will happily put a whole night's heat into the cheapest hour
+                        at full power.</p>
+                    <p>The plan's power for the slot that is running is published as
+                        <strong>Planned Power</strong> (<code>managed_load/&lt;id&gt;/planned_power_w</code>).
+                        A heat pump rarely takes a power setpoint directly; an automation turns it into
+                        what the pump does take &mdash; a room or flow setpoint offset, a power limit, an
+                        SG-Ready level. The pump keeps its own control, so the match is approximate; the next
+                        plan starts from the temperature the house really reached.</p>
+
                     <h3 id="managed-loads-exclusive">One machine, two loads</h3>
                     <p>A heat pump that heats the house and makes hot water is one compressor: at
                         any moment it does one or the other. Configured as two loads &mdash; a
