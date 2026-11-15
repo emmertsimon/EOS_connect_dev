@@ -7,6 +7,7 @@ battery that tapers at 90 % is not planned as if it filled at full power to 100 
 The checks read the solved numbers back rather than trusting the constraint.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -136,6 +137,46 @@ def test_exact_planning_charges_less_than_the_envelope_promises():
     envelope_charge, envelope_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2)
     exact_charge, exact_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=True)
     assert exact_soc[0] < envelope_soc[0] - 50
+
+
+def test_exact_planning_out_of_time_keeps_the_envelope_plan(monkeypatch, caplog):
+    """No time left for the exact round: the envelope plan stands, and the log says so."""
+    envelope_charge, envelope_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2)
+    monkeypatch.setattr(Optimizer, "CURVE_REFINE_BUDGET_MIN_S", 0.0)
+    monkeypatch.setattr(Optimizer, "CURVE_REFINE_BUDGET_FACTOR", 0.0)
+    with caplog.at_level(logging.WARNING):
+        charge, soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=True)
+    assert soc == pytest.approx(envelope_soc, abs=1e-3)
+    assert charge == pytest.approx(envelope_charge, abs=1e-3)
+    assert "no exact plan within" in caplog.text
+
+
+def test_a_round_the_solver_cannot_finish_falls_back_to_the_round_before(monkeypatch, caplog):
+    """
+    The exact round gets what is left of the budget as its time limit. If the solver
+    stops without any plan, the plan of the round before is the result - not an
+    empty one - and the solver's own limit is back in place afterwards.
+    """
+    envelope_charge, envelope_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2)
+    real_solve = pulp.LpProblem.solve
+    limits = []
+
+    def solve_then_give_up(self, solver=None, **kwargs):
+        limits.append(solver.timeLimit)
+        result = real_solve(self, solver, **kwargs)
+        if len(limits) > 1:
+            self.status = pulp.LpStatusNotSolved
+        return result
+
+    monkeypatch.setattr(pulp.LpProblem, "solve", solve_then_give_up)
+    with caplog.at_level(logging.WARNING):
+        charge, soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=True)
+    assert len(limits) == 2
+    assert limits[0] == 60
+    assert 0 < limits[1] <= Optimizer.CURVE_REFINE_BUDGET_MIN_S
+    assert soc == pytest.approx(envelope_soc, abs=1e-3)
+    assert charge == pytest.approx(envelope_charge, abs=1e-3)
+    assert "no exact plan within" in caplog.text
 
 
 def test_lines_that_can_never_bind_are_left_out():
