@@ -2958,7 +2958,7 @@ _ALL_FIELDS: list[FieldDef] = [
             "published as Planned Power, for an automation to turn into a setpoint. "
             "0 = it runs at rated power only"
         ),
-        hot_reload=True,
+        labels=["restart_required"],
         help_url="config-managed-loads.html#managed-loads-modulation",
         validation={"min": 0, "max": 100000},
         depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
@@ -2977,7 +2977,7 @@ _ALL_FIELDS: list[FieldDef] = [
             "flat outside. Only used with a minimum power. Empty = the same COP at "
             "every power"
         ),
-        hot_reload=True,
+        labels=["restart_required"],
         help_url="config-managed-loads.html#managed-loads-modulation",
         depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
         display_group="Physical",

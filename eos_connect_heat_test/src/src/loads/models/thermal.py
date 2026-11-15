@@ -28,7 +28,7 @@ from .. import efficiency as slot_efficiency
 from .base import KIND_CONTINGENT, BaseDemandModel, EnergyDemand
 from .calibration import IDLE_POWER_W, ThermalCalibrator
 from .cover_habit import OBSERVED_HOURS, CoverHabit
-from ..modulation import ModulationError, parse_modulation
+from ..modulation import ModulationError, factor_at, parse_modulation
 from .thermal_physics import (
     WH_PER_M3_PER_K,
     cop_at,
@@ -129,7 +129,7 @@ class ThermalStorageModel(BaseDemandModel):
         self.cover_habit = CoverHabit()
 
     def _new_calibrator(self):
-        return ThermalCalibrator(
+        calibrator = ThermalCalibrator(
             volume_m3=self.volume_m3,
             surface_m2=self.surface_m2,
             loss_coefficient=self.config.get("heat_loss_w_per_m2_k", 25.0),
@@ -139,6 +139,20 @@ class ThermalStorageModel(BaseDemandModel):
             idle_power_w=self.standby_threshold_w,
             **self.calibration_options,
         )
+        calibrator.cop_factor = self._modulation_factor()
+        return calibrator
+
+    def _modulation_factor(self):
+        """
+        The COP factor by electrical power, for the calibrator - or None.
+
+        Only where the planner applies the curve too (a minimum power is set): the
+        level the calibrator learns is the COP at factor 1.0, and the planner scales it.
+        """
+        if not self.modulation or self.min_power_w <= 0:
+            return None
+        points = list(self.modulation)
+        return lambda power_w: factor_at(points, power_w)
 
     def _apply_config(self, config):
         """
@@ -199,6 +213,7 @@ class ThermalStorageModel(BaseDemandModel):
         # The threshold is a pure classification change: no window, row or coefficient
         # is invalidated by it, so the fit carries over.
         self.calibrator.set_idle_threshold(self.standby_threshold_w)
+        self.calibrator.cop_factor = self._modulation_factor()
 
     def reset_calibration(self):
         """Discard what has been learned and start again from the configured values."""
