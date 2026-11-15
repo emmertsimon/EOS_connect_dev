@@ -58,6 +58,12 @@ class DemandContext:
     # left the bias estimate unable to survive a restart.
     ambient_measured_c: object = None
     ambient_forecast_c: object = None
+    # The air a heat pump draws its heat from, where that is not the store's own
+    # surroundings - an indoor hot water tank heated by an outdoor unit. Empty means
+    # "the same air", and the COP follows ambient_temp_c as before.
+    cop_air_temp_c: list = field(default_factory=list)
+    cop_air_measured_c: object = None
+    cop_air_forecast_c: object = None
     price_eur_per_wh: list = field(default_factory=list)
     feed_in_eur_per_wh: list = field(default_factory=list)
     pv_surplus_wh: list = field(default_factory=list)
