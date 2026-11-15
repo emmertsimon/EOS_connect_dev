@@ -619,3 +619,96 @@ class TestShutdown:
 
     def test_shutdown_does_not_raise(self, inverter):
         inverter.shutdown()  # should not raise
+
+
+# =========================================================================
+# Charge limit (optional inverter.charge_limit sequence)
+# =========================================================================
+
+
+CHARGE_LIMIT_STEP = {
+    "service": "script.battery_charge_limit",
+    "data": {"power": "{{ power }}"},
+}
+
+
+@pytest.fixture
+def limited(default_config):
+    """An InverterHA with a charge_limit sequence, as JSON text like the store keeps it."""
+    import json  # pylint: disable=import-outside-toplevel
+
+    return InverterHA({**default_config, "charge_limit": json.dumps([CHARGE_LIMIT_STEP])})
+
+
+class TestSetChargeLimit:
+    """HA hears about the limit on change, as a refresh, and after a failure."""
+
+    def test_without_a_sequence_nothing_is_sent(self, inverter):
+        with patch.object(inverter, "_call_service") as call:
+            assert inverter.set_charge_limit(3000) is None
+        call.assert_not_called()
+
+    def test_the_first_value_is_sent_with_power_filled_in(self, limited, caplog):
+        with patch.object(limited, "_call_service", return_value=True) as call:
+            with caplog.at_level("INFO"):
+                assert limited.set_charge_limit(3200.4) is True
+        call.assert_called_once_with(CHARGE_LIMIT_STEP, {"power": 3200})
+        assert "Charge limit set to 3200 W" in caplog.text
+
+    def test_an_unchanged_value_is_not_sent_again(self, limited):
+        with patch.object(limited, "_call_service", return_value=True) as call:
+            limited.set_charge_limit(3200)
+            assert limited.set_charge_limit(3200) is True
+        assert call.call_count == 1
+
+    def test_a_new_value_is_sent_at_once(self, limited):
+        with patch.object(limited, "_call_service", return_value=True) as call:
+            limited.set_charge_limit(6000)
+            limited.set_charge_limit(3200)
+        assert [c.args[1]["power"] for c in call.call_args_list] == [6000, 3200]
+
+    def test_an_unchanged_value_is_refreshed_after_a_while(self, limited):
+        clock = [1000.0]
+        with patch("src.interfaces.inverters.inverter_ha.time.monotonic", lambda: clock[0]):
+            with patch.object(limited, "_call_service", return_value=True) as call:
+                limited.set_charge_limit(3200)
+                clock[0] += limited.CHARGE_LIMIT_REFRESH_S - 1
+                limited.set_charge_limit(3200)
+                clock[0] += 2
+                limited.set_charge_limit(3200)
+        assert call.call_count == 2
+
+    def test_a_failed_call_is_retried_after_the_pause_not_every_cycle(self, limited):
+        clock = [1000.0]
+        results = iter([False, True])
+        with patch("src.interfaces.inverters.inverter_ha.time.monotonic", lambda: clock[0]):
+            with patch.object(
+                limited, "_call_service", side_effect=lambda *a: next(results)
+            ) as call:
+                assert limited.set_charge_limit(500) is False
+                clock[0] += 5
+                assert limited.set_charge_limit(500) is False  # no new call
+                clock[0] += limited.CHARGE_LIMIT_RETRY_S
+                assert limited.set_charge_limit(500) is True
+        assert call.call_count == 2
+
+    def test_negative_values_become_zero(self, limited):
+        with patch.object(limited, "_call_service", return_value=True) as call:
+            limited.set_charge_limit(-200)
+        assert call.call_args.args[1] == {"power": 0}
+
+    def test_a_call_under_way_is_not_queued_behind(self, limited):
+        limited._charge_limit_lock.acquire()
+        try:
+            with patch.object(limited, "_call_service") as call:
+                assert limited.set_charge_limit(3200) is False
+            call.assert_not_called()
+        finally:
+            limited._charge_limit_lock.release()
+
+    def test_other_inverters_ignore_the_limit(self):
+        from src.interfaces.inverters.null_inverter import (  # pylint: disable=import-outside-toplevel
+            NullInverter,
+        )
+
+        assert NullInverter({"type": "default"}).set_charge_limit(3000) is None
