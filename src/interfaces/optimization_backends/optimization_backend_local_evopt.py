@@ -24,8 +24,17 @@ from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
 )
+from ..charging_curve import (
+    ChargingCurveError,
+    concave_pieces,
+    envelope_deviation,
+    envelope_exact_up_to,
+    envelope_segments,
+    limited_pieces,
+)
 from .local_evopt.optimizer import (
     BatteryConfig,
+    ChargeCurveConfig,
     CbcSolverUnavailableError,
     GridConfig,
     ManagedLoadConfig,
@@ -93,6 +102,7 @@ class LocalEVOptBackend(EVOptBackend):
         max_grid_export_w=None,
         plan_stability_weight=plan_stability.DEFAULT_WEIGHT,
         plan_stability_scope=plan_stability.SCOPE_MANAGED_LOADS,
+        exact_charging_curve=False,
     ):
         # base_url is not used in-process; pass a placeholder so parent __init__ is happy
         super().__init__(
@@ -103,6 +113,12 @@ class LocalEVOptBackend(EVOptBackend):
         )
         self.num_threads = num_threads
         self.time_limit = time_limit
+        # Plan a curve that bends upward exactly (binaries) rather than along its
+        # concave envelope (linear). See charging_curve.limited_pieces.
+        self.exact_charging_curve = bool(exact_charging_curve)
+        # Charging curve of the run in progress, [(soc_percent, power_w), ...] or None
+        self._charge_curve = None
+        self._charge_curve_shape = None
         if charging_strategy in CHARGING_STRATEGIES:
             self.charging_strategy = charging_strategy
         else:
@@ -135,9 +151,16 @@ class LocalEVOptBackend(EVOptBackend):
     # loads out of `gesamtlast` and passes them here instead. An attribute rather than
     # a subclass check so a future backend can opt in without anyone editing the caller.
     schedules_managed_loads = True
+    # Likewise for the battery's charging curve: the caller hands it over only when
+    # this is set, and then gives the solver the full charge power as its ceiling.
+    plans_charge_curve = True
+    # A curve with more upward bends than this is merged down to it (see
+    # charging_curve.limited_pieces). Each piece is a binary per slot; three keeps a
+    # two-day quarter-hourly solve at about a second, five took several.
+    MAX_CHARGE_CURVE_PIECES = 3
 
     def optimize(self, eos_request, timeout=180, managed_loads=None,
-                 managed_load_budget_w=0.0):
+                 managed_load_budget_w=0.0, battery_charge_curve=None):
         """
         Run the MILP optimizer in-process.
 
@@ -151,7 +174,11 @@ class LocalEVOptBackend(EVOptBackend):
         beside the request rather than inside it: that dict goes over the wire verbatim
         to an EOS server, which validates what it is sent, and nothing outside this
         solver can use them anyway.
+
+        *battery_charge_curve* is ``[(soc_percent, power_w), ...]``; with it every slot's
+        charge is held under the curve at the state of charge the plan reaches there.
         """
+        self._set_charge_curve(battery_charge_curve)
         evopt_request, errors = self._transform_request_from_eos_to_evopt(eos_request)
         if errors:
             logger.error("[OPT-LocalEVopt] Request transformation errors: %s", errors)
@@ -281,6 +308,97 @@ class LocalEVOptBackend(EVOptBackend):
         if optimizer.plan_stability_weight > 0:
             optimizer.previous_plan = self.plan_memory.previous(plan_start, optimizer.T)
 
+    def _set_charge_curve(self, curve):
+        """
+        Keep the curve for this run; both solves of a run (see the managed-load cost)
+        must see the same battery.
+
+        Logged when its shape changes. A temperature-derated curve is rescaled on
+        nearly every run while the battery warms or cools, which is not news.
+        """
+        points = None
+        if curve:
+            try:
+                points = sorted((float(soc), float(power)) for soc, power in curve)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[OPT-LocalEVopt] charging curve ignored - not a list of "
+                    "(SOC, power) pairs: %r", curve,
+                )
+                points = None
+        shape = self._curve_shape(points)
+        if shape != self._charge_curve_shape:
+            if points:
+                logger.info(
+                    "[OPT-LocalEVopt] Planning with the charging curve per slot: %s%s",
+                    ", ".join(f"{soc:g}%:{power:.0f}W" for soc, power in points),
+                    self._curve_note(points),
+                )
+            else:
+                logger.info("[OPT-LocalEVopt] Planning without a charging curve")
+        self._charge_curve = points
+        self._charge_curve_shape = shape
+
+    def _curve_note(self, points):
+        """What the log should add about how exactly the curve is planned."""
+        try:
+            stretches = len(concave_pieces(points))
+            over = envelope_deviation(points)
+        except ChargingCurveError:
+            return ""
+        if stretches <= 1:
+            return ""
+        if not self.exact_charging_curve:
+            return (
+                f" (it bends upward, so it is planned along its envelope - up to"
+                f" {over:.0f} W generous near full; local_evopt_exact_charging_curve"
+                f" plans it exactly)"
+            )
+        if stretches > self.MAX_CHARGE_CURVE_PIECES:
+            return (
+                f" (exact, merged from {stretches} to {self.MAX_CHARGE_CURVE_PIECES}"
+                f" stretches to keep the solve fast)"
+            )
+        return f" (exact, {stretches} stretches)"
+
+    @staticmethod
+    def _curve_shape(points):
+        """The curve with its scale divided out, to tell a new curve from a derated one."""
+        if not points:
+            return None
+        peak = max(power for _, power in points) or 1.0
+        return tuple((soc, round(power / peak, 3)) for soc, power in points)
+
+    def _charge_curve_config(self, s_capacity):
+        """The curve in the solver's units - Wh of state of charge - or None."""
+        points = self._charge_curve
+        if not points or s_capacity <= 0:
+            return None
+        try:
+            envelope = envelope_segments(points)
+            if self.exact_charging_curve:
+                pieces = limited_pieces(points, self.MAX_CHARGE_CURVE_PIECES)
+                exact_up_to = envelope_exact_up_to(points)
+            else:
+                # One piece: the envelope alone, linear in every slot.
+                pieces = [(0.0, 100.0, envelope)]
+                exact_up_to = 100.0
+        except ChargingCurveError:
+            return None
+        per_wh = 100.0 / s_capacity
+
+        def wh(soc):
+            return soc / 100.0 * s_capacity
+
+        def lines_in_wh(lines):
+            return [(wh(soc), power, slope * per_wh) for soc, power, slope in lines]
+
+        return ChargeCurveConfig(
+            pieces=[(wh(lo), wh(hi), lines_in_wh(lines)) for lo, hi, lines in pieces],
+            envelope=lines_in_wh(envelope),
+            envelope_exact_below=wh(exact_up_to),
+        )
+
     def _build_optimizer(self, evopt_request, timeout, managed_loads=None,
                          managed_load_budget_w=0.0):
         """Construct the Optimizer object from an EVopt-format request dict."""
@@ -339,6 +457,7 @@ class LocalEVOptBackend(EVOptBackend):
                 p_a=float(bat_data.get("p_a", 0)),
                 c_priority=int(bat_data.get("c_priority", 0)),
                 s_reserve=s_reserve_wh,
+                charge_curve=self._charge_curve_config(s_capacity),
             ))
 
         ts_data = evopt_request.get("time_series", {})

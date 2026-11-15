@@ -949,6 +949,24 @@ _ALL_FIELDS: list[FieldDef] = [
         hot_reload=True,
     ),
     FieldDef(
+        key="eos.local_evopt_exact_charging_curve",
+        field_type="bool",
+        default=False,
+        section="eos",
+        level="expert",
+        description=(
+            "Plan a charging curve that bends upward (a hard drop at the top followed "
+            "by a long tail) exactly instead of along its envelope. More accurate near "
+            "full, but every slot that reaches the top costs the solver extra binaries "
+            "- solves take seconds instead of a fraction of one. A curve that only "
+            "gets steeper towards full is planned exactly either way"
+        ),
+        labels=["restart_required"],
+        help_url="config-battery.html#charging-curve",
+        depends_on={"eos.source": "local_evopt"},
+        display_group="Local Optimizer",
+    ),
+    FieldDef(
         key="eos.local_evopt_terminal_soc_value",
         field_type="select",
         default="cheapest_ahead",
@@ -1521,7 +1539,26 @@ _ALL_FIELDS: list[FieldDef] = [
         level="standard",
         description="Enable charging curve for controlled charging power according to SOC",
         labels=["restart_required"],
-        help_url="config-battery.html#battery",
+        help_url="config-battery.html#charging-curve",
+        display_group="Charging",
+    ),
+    FieldDef(
+        key="battery.charging_curve_points",
+        field_type="str",
+        default="",
+        section="battery",
+        level="standard",
+        description=(
+            "Your battery's charging curve as SOC:power points, e.g. "
+            "'0:6000, 90:6000, 95:3000, 100:800' (power in W, or in % of the maximum "
+            "charge power: '90:100%, 100:15%'). Interpolated in between and held flat "
+            "outside. Used for the live charge limit and, with the built-in optimizer, "
+            "for every slot of the plan. Empty = built-in curve (full power to 50 %, "
+            "then a steady taper)"
+        ),
+        labels=["restart_required"],
+        help_url="config-battery.html#charging-curve",
+        depends_on={"battery.charging_curve_enabled": [True]},
         display_group="Charging",
     ),
     FieldDef(

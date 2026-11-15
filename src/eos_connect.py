@@ -1220,7 +1220,15 @@ def create_optimize_request():
             "charging_curve_enabled", True
         )
 
-        if is_dynamic and current_dynamic_max > 0:
+        if is_dynamic and getattr(eos_interface, "plans_charge_curve", False):
+            # The backend plans the curve slot by slot from the state of charge it
+            # predicts there, so it gets the full power as its ceiling. Handing it
+            # today's tapered value instead would cap every slot of the horizon at
+            # what the battery takes *now* - at 95 % that is the overnight recharge
+            # after the evening's discharge planned at a fraction of its real rate.
+            max_charge_power = config_fixed_max
+            source_label = "curve_per_slot"
+        elif is_dynamic and current_dynamic_max > 0:
             max_charge_power = current_dynamic_max
             source_label = "dynamic"
         elif is_dynamic and current_dynamic_max == 0:
@@ -1718,16 +1726,19 @@ class OptimizationScheduler:
         mqtt_interface.update_publish_topics(
             {"optimization/state": {"value": self.get_current_state()["request_state"]}}
         )
+        optimize_kwargs = {}
         if managed_records is not None:
-            optimized_response, avg_runtime = eos_interface.optimize(
-                json_optimize_input,
-                managed_loads=managed_records,
-                managed_load_budget_w=load_manager.max_power_w,
+            optimize_kwargs["managed_loads"] = managed_records
+            optimize_kwargs["managed_load_budget_w"] = load_manager.max_power_w
+        if getattr(eos_interface, "plans_charge_curve", False):
+            # Beside the request, like the managed loads: the request is posted
+            # verbatim to an EOS server, and only the built-in solver reads a curve.
+            optimize_kwargs["battery_charge_curve"] = (
+                battery_interface.get_charge_curve_for_planning()
             )
-        else:
-            optimized_response, avg_runtime = eos_interface.optimize(
-                json_optimize_input
-            )
+        optimized_response, avg_runtime = eos_interface.optimize(
+            json_optimize_input, **optimize_kwargs
+        )
         # Store the runtime for use in sleep calculation (defensive against None)
         try:
             if avg_runtime is None:
