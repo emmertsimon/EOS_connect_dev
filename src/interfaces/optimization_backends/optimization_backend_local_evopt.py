@@ -405,8 +405,12 @@ class LocalEVOptBackend(EVOptBackend):
             return build_and_solve(None, budget_s)
 
         # Run 1: the curve's limit at the current SOC for the first slot - the same
-        # value the control loop applies right now - and below the curve's knee after.
-        caps = [charge_power_limit(initial_soc)] + [charge_power_limit(0.0)] * (n_slots - 1)
+        # value the control loop applies right now - and the curve's maximum after.
+        # Not its value at 0 %: the limits only ever come down from here, and a curve
+        # that rises from the bottom (a cold-protected pack, points that start low)
+        # would otherwise cap the whole plan at its lowest value.
+        top = self._curve_maximum(charge_power_limit)
+        caps = [charge_power_limit(initial_soc)] + [top] * (n_slots - 1)
         result = build_and_solve(
             caps, None if budget_s is None else budget_s * FIRST_RUN_BUDGET_SHARE
         )
@@ -458,6 +462,19 @@ class LocalEVOptBackend(EVOptBackend):
                 return result
             result = candidate
         return result
+
+    @staticmethod
+    def _curve_maximum(charge_power_limit):
+        """
+        The highest limit the curve gives anywhere from 0 to 100 % SOC.
+
+        Sampled at every whole percent and at the curve's own points when it carries
+        them (``.points``) - a curve from points is linear in between, so its maximum
+        sits on one of them. For the built-in formula this is its value at 0 %.
+        """
+        socs = {float(soc) for soc in range(101)}
+        socs.update(float(soc) for soc, _ in getattr(charge_power_limit, "points", None) or [])
+        return max(charge_power_limit(soc) for soc in socs if 0.0 <= soc <= 100.0)
 
     @staticmethod
     def _is_solved(evopt_response):

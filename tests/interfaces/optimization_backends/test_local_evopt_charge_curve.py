@@ -30,6 +30,7 @@ from src.interfaces.optimization_backends.local_evopt.optimizer import (
 from src.interfaces.optimization_backends.optimization_backend_local_evopt import (
     LocalEVOptBackend,
 )
+from src.interfaces.charging_curve import curve_power_at
 from src.interfaces.optimization_interface import OptimizationInterface
 
 DATETIME_PATH = (
@@ -197,10 +198,32 @@ def test_without_a_curve_there_is_one_run_with_the_fixed_limit():
     assert seen == [None]
 
 
-def test_the_first_run_uses_the_current_soc_then_the_curve_below_its_knee():
+def test_the_first_run_uses_the_current_soc_then_the_curve_maximum():
     backend, seen = _fake_backend([[4000.0, 4500.0, 4800.0]])
     backend._solve_with_charge_curve(EVOPT_REQ, EOS_REQ, 60, None, 0.0, _knee_curve)
     assert seen[0] == [5000.0, 5000.0, 5000.0]
+
+
+def _rising_curve(soc):
+    """Low at the bottom, full power in the middle, a taper at the top."""
+    return curve_power_at([(0, 1000), (10, 5000), (90, 5000), (100, 500)], soc)
+
+
+def test_a_curve_that_rises_from_empty_starts_from_its_maximum():
+    """Started at the curve's value at 0 %, the limits - which only come down - held
+    every slot to the 1 kW of an empty battery."""
+    backend, seen = _fake_backend([[4000.0, 4500.0, 4800.0]])
+    eos_req = {"pv_akku": {"capacity_wh": 10000, "initial_soc_percentage": 20}}
+    backend._solve_with_charge_curve(EVOPT_REQ, eos_req, 60, None, 0.0, _rising_curve)
+    assert seen[0] == [5000.0, 5000.0, 5000.0]
+
+
+def test_the_maximum_is_found_between_whole_percents_when_points_come_along():
+    def peaked(soc):
+        return curve_power_at([(0, 1000), (42.5, 4000), (100, 1000)], soc)
+
+    peaked.points = [(0.0, 1000.0), (42.5, 4000.0), (100.0, 1000.0)]
+    assert LocalEVOptBackend._curve_maximum(peaked) == pytest.approx(4000.0)
 
 
 def test_the_loop_stops_once_the_limits_stop_changing():
@@ -264,6 +287,25 @@ def test_the_plan_charges_no_faster_than_the_curve_allows(backend):
             charged <= _knee_curve(soc) + 1.0
         ), f"slot {t}: charged {charged:.0f} Wh starting at {soc:.1f} % SOC"
     assert max(battery["charging_power"]) > 1000.0, "below the knee it may charge fast"
+
+
+def test_a_curve_that_rises_from_empty_does_not_cap_the_whole_plan(backend):
+    """20 kWh at 20 %, four cheap hours: the battery fills at the curve's 5 kW, not
+    at the 1 kW the curve gives an empty battery (which ended the cheap hours near
+    58 %)."""
+    price = [0.0001] * 4 + [0.0006] * 44
+    eos_request = _request(
+        capacity_wh=20000, initial_soc=20, price=price, load=[800.0] * 48
+    )
+    _, response = _solve(backend, eos_request, _rising_curve)
+
+    assert response["status"] == "Optimal"
+    battery = response["batteries"][0]
+    starts = [20.0] + [s / 20000 * 100 for s in battery["state_of_charge"][:-1]]
+    for t, (charged, soc) in enumerate(zip(battery["charging_power"], starts)):
+        assert charged <= _rising_curve(soc) + 1.0, f"slot {t} at {soc:.1f} %"
+    assert sorted(battery["charging_power"][:4])[-2] > 4000.0, "not just one fast slot"
+    assert battery["state_of_charge"][3] / 20000 * 100 > 90.0
 
 
 def test_a_full_battery_still_covers_a_load_peak(backend):

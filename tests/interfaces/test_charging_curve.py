@@ -1,0 +1,116 @@
+"""
+The charging curve as the user writes it, and as the live limit and the plan read it.
+
+Both consumers - config validation and the battery interface, which hands the curve
+on to the live limit and the plan - go through these functions, so a disagreement shows up here
+first.
+"""
+
+import pytest
+
+from src.interfaces.charging_curve import (
+    ChargingCurveError,
+    curve_power_at,
+    parse_curve_points,
+    validate_curve_text,
+)
+
+MAX_W = 6000
+
+
+# -- parsing -----------------------------------------------------------------------------
+
+
+def test_points_in_watts_are_read_and_sorted():
+    points = parse_curve_points("100:800, 0:6000, 95:3000, 90:6000", MAX_W)
+    assert points == [(0.0, 6000.0), (90.0, 6000.0), (95.0, 3000.0), (100.0, 800.0)]
+
+
+def test_power_can_be_a_share_of_the_maximum_or_in_kw():
+    points = parse_curve_points("90:100%, 95:1.5kW, 100:10 %", MAX_W)
+    assert points == [(90.0, 6000.0), (95.0, 1500.0), (100.0, 600.0)]
+
+
+def test_a_decimal_comma_works_when_points_are_split_by_semicolons_or_lines():
+    assert parse_curve_points("90:6000; 92,5:4000\n100:500", MAX_W) == [
+        (90.0, 6000.0), (92.5, 4000.0), (100.0, 500.0),
+    ]
+
+
+def test_with_plain_commas_a_comma_always_separates_points():
+    """'90:6000,5:3000' is two points, never 90 % then 6000.5 W."""
+    assert parse_curve_points("90:6000,5:3000", MAX_W) == [(5.0, 3000.0), (90.0, 6000.0)]
+
+
+def test_power_above_the_maximum_is_capped_to_it():
+    assert parse_curve_points("50:9000", MAX_W) == [(50.0, 6000.0)]
+
+
+def test_empty_text_means_no_points():
+    assert parse_curve_points("", MAX_W) == []
+    assert parse_curve_points("   ", MAX_W) == []
+    assert parse_curve_points(None, MAX_W) == []
+
+
+def test_pairs_are_accepted_as_a_list_too():
+    assert parse_curve_points([[100, 800], [0, 6000]], MAX_W) == [(0.0, 6000.0), (100.0, 800.0)]
+
+
+@pytest.mark.parametrize(
+    "text, fragment",
+    [
+        ("abc", "not a point"),
+        ("90-6000", "not a point"),
+        ("110:300", "between 0 and 100"),
+        ("90:-5", "must not be negative"),
+        ("90:6000, 90:5000", "given twice"),
+        ("50:150%", "more than 100 %"),
+    ],
+)
+def test_bad_points_are_refused_with_a_message_naming_them(text, fragment):
+    with pytest.raises(ChargingCurveError, match=fragment):
+        parse_curve_points(text, MAX_W)
+    assert fragment in validate_curve_text(text, MAX_W)
+
+
+@pytest.mark.parametrize("text", ["0:6000, 90:6000,", "0:6000; 90:6000;", "0:6000\n90:6000\n"])
+def test_a_trailing_separator_is_ignored(text):
+    assert parse_curve_points(text, MAX_W) == [(0.0, 6000.0), (90.0, 6000.0)]
+
+
+def test_a_vertical_step_is_refused_with_the_way_to_write_it():
+    message = validate_curve_text("0:6000, 90:6000, 90:3200", MAX_W)
+    assert "given twice" in message
+    assert "'90:6000, 90.5:3200'" in message
+    # the suggestion parses, and keeps to the range at the top
+    assert validate_curve_text("0:6000, 90:6000, 90.5:3200", MAX_W) == ""
+    assert "'99.5:3200, 100:300'" in validate_curve_text("100:3200, 100:300", MAX_W)
+
+
+def test_validation_passes_a_good_curve_even_without_a_known_maximum():
+    assert validate_curve_text("0:100%, 90:100%, 100:15%") == ""
+
+
+# -- interpolation -----------------------------------------------------------------------
+
+
+CURVE = [(0.0, 6000.0), (90.0, 6000.0), (95.0, 3000.0), (100.0, 800.0)]
+
+
+@pytest.mark.parametrize(
+    "soc, power",
+    [(0, 6000), (50, 6000), (90, 6000), (92.5, 4500), (95, 3000), (97.5, 1900), (100, 800)],
+)
+def test_power_is_interpolated_linearly(soc, power):
+    assert curve_power_at(CURVE, soc) == pytest.approx(power)
+
+
+def test_the_curve_is_held_flat_outside_its_points():
+    points = [(20.0, 4000.0), (80.0, 2000.0)]
+    assert curve_power_at(points, 5) == 4000.0
+    assert curve_power_at(points, 95) == 2000.0
+
+
+def test_a_single_point_is_a_constant_limit():
+    assert curve_power_at([(70.0, 2500.0)], 10) == 2500.0
+    assert curve_power_at([(70.0, 2500.0)], 99) == 2500.0
