@@ -958,8 +958,9 @@ _ALL_FIELDS: list[FieldDef] = [
             "Plan a charging curve that bends upward (a hard drop at the top followed "
             "by a long tail) exactly instead of along its envelope. More accurate near "
             "full, but every slot that reaches the top costs the solver extra binaries "
-            "- solves take seconds instead of a fraction of one. A curve that only "
-            "gets steeper towards full is planned exactly either way"
+            "- solves take seconds instead of a fraction of one, capped at four times "
+            "the plain solve (at least 5 s). A curve that only gets steeper towards "
+            "full is planned exactly either way"
         ),
         labels=["restart_required"],
         help_url="config-battery.html#charging-curve",
