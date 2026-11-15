@@ -294,3 +294,20 @@ def test_registered_values_publish_through_the_normal_path(manager):
     # built-in topics use.
     published = dict(interface.client.published)
     assert published["eos_connect/managed_load/pool/released"] == "true"
+
+
+def test_the_planned_power_of_the_running_slot_is_published(manager):
+    """For a modulating appliance it is the setpoint - a release flag cannot carry it."""
+    assert f"{PREFIX}/pool/planned_power_w" in build_topics(manager)
+    manager.run_cycle()
+    item = manager.instance("pool")
+    ctx = manager._last_ctx_for["pool"]
+    plan = [0.0] * ctx.slot_count
+    plan[ctx.current_slot] = 600.0 * ctx.hours_per_slot()
+    item.last_plan = plan
+    values = build_values(manager)
+    assert values[f"{PREFIX}/pool/planned_power_w"]["value"] == pytest.approx(600.0)
+
+
+def test_no_planned_power_before_the_first_plan(manager):
+    assert f"{PREFIX}/pool/planned_power_w" not in build_values(manager)

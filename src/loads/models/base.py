@@ -103,6 +103,10 @@ class EnergyDemand:
             past its daily runtime cap.
         max_power_w: Electrical power draw while running. Bounds how much energy the
             planner may put into a single slot.
+        min_power_w: A modulating appliance's lowest draw while running; the planner
+            then picks a power between it and max_power_w in every slot it runs.
+        modulation: ``[(power_w, factor), ...]`` - the COP across that range, as a
+            factor on the model's per-slot COP. Empty means the same COP throughout.
         deadline_slot: Contingent only. Last slot the energy may occupy, or None for
             "anywhere in the horizon".
         efficiency: Contingent only. Per-slot worth of a Wh relative to the best slot,
@@ -125,6 +129,11 @@ class EnergyDemand:
     # Filled in by the planner: what became of every slot. See `loads.planner`.
     slot_reasons: list = field(default_factory=list)
     max_power_w: float = 0.0
+    # A modulating appliance: the least it draws while running, and how its COP
+    # changes with the power drawn (``[(power_w, factor), ...]``, see
+    # `loads.modulation`). 0 and [] for an appliance that runs at max_power_w only.
+    min_power_w: float = 0.0
+    modulation: list = field(default_factory=list)
     efficiency: list = field(default_factory=list)
     # Contingent only, and only for a store planned by its temperature rather than by
     # an amount: the physics the solver needs to follow the store slot by slot - see

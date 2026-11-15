@@ -967,3 +967,60 @@ def test_a_store_that_leaks_faster_than_it_holds_stays_a_store():
     # given - never below the air, never anywhere near the model's own -50..150 rails.
     assert min(temps) >= 5.0 - 0.01
     assert max(temps) <= 35.0
+
+
+# --- a modulating heat pump ---------------------------------------------------------------
+
+from src.loads.modulation import heat_lines  # noqa: E402
+
+MEASURED_CURVE = [(400, 1.0), (800, 1.0), (1200, 0.93), (1500, 0.81), (1700, 0.74)]
+
+
+def _modulating(min_w=300.0, max_w=2800.0, curve=MEASURED_CURVE, **kwargs):
+    lines = heat_lines(curve, min_w, max_w) if curve else None
+    return _house(power=max_w, min_power_w=min_w, heat_lines=lines,
+                  min_runtime_slots=2, **kwargs)
+
+
+def _running(result):
+    return [energy for energy in _placed(result, "house") if energy > 1e-6]
+
+
+def test_a_modulating_load_runs_between_its_minimum_and_its_maximum():
+    result = _optimizer([_modulating(t0=21.0)], battery=False).solve()
+    assert result["status"] == "Optimal"
+    running = _running(result)  # hourly slots: Wh equals W
+    assert running
+    assert all(300 - 1e-6 <= energy <= 2800 + 1e-6 for energy in running)
+
+
+def test_with_falling_efficiency_flat_prices_spread_the_heat_at_low_power():
+    """Same price every hour: the only reason left to pick a power is the heat it buys."""
+    result = _optimizer([_modulating(t0=21.0)], battery=False).solve()
+    assert max(_running(result)) <= 800 + 1e-6
+
+
+def test_a_nearly_free_hour_is_worth_full_power_anyway():
+    prices = [DEAR] * T
+    prices[2] = prices[3] = 0.000005
+    result = _optimizer([_modulating(t0=21.0)], prices=prices, battery=False).solve()
+    placed = _placed(result, "house")
+    assert max(placed[2], placed[3]) >= 1700 - 1e-6
+
+
+def test_the_house_warms_by_the_heat_bought_not_by_the_watts_drawn():
+    """At 2.8 kW the curve gives ~0.53 of the per-slot COP; the store must feel that."""
+    prices = [DEAR] * T
+    prices[2] = prices[3] = 0.000005
+    opt = _optimizer([_modulating(t0=21.0)], prices=prices, battery=False)
+    result = opt.solve()
+    heat = [pulp.value(var) for var in opt.variables['ml_heat'][0]]
+    for drawn, felt in zip(_placed(result, "house"), heat):
+        expected = min(s * drawn + i for s, i in heat_lines(MEASURED_CURVE, 300, 2800)) if drawn > 1e-6 else 0.0
+        assert felt <= expected + 1e-3
+
+
+def test_without_a_minimum_the_load_still_runs_at_its_rated_power_only():
+    load = _house(t0=21.0, power=900.0, min_runtime_slots=2)
+    result = _optimizer([load], battery=False).solve()
+    assert all(abs(energy - 900.0) < 1e-3 for energy in _running(result))
