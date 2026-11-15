@@ -1646,6 +1646,13 @@ class Optimizer:
         formulation and the problem is solved again; the remaining slots stay below
         that point, where envelope and curve agree. Usually one or two rounds.
 
+        The managed loads' switches (a heat pump's runtime blocks, the dishwasher's
+        start) are held where the first solve put them. Those binaries are what makes
+        a solve slow, and where the battery tops up near full hardly moves them: with
+        them held, a round costs about what a plan without managed loads does, rather
+        than a second full branch and bound. Their energy stays free within the held
+        blocks, and so does everything the battery and the grid do.
+
         The rounds share a time budget. A round that runs out of it keeps the best
         plan the solver found by then - that one obeys the curve too. If it found
         none, the plan of the round before stands, and the log names the slots in
@@ -1657,6 +1664,10 @@ class Optimizer:
             budget = min(budget, float(self.settings.time_limit))
         deadline = time.monotonic() + budget
         own_limit = solver.timeLimit
+        switches = {
+            var.name: round(pulp.value(var) or 0.0)
+            for var in self._managed_load_switches()
+        }
         try:
             for _ in range(self.CURVE_REFINE_ROUNDS):
                 if pulp.LpStatus[self.problem.status] != 'Optimal':
@@ -1677,6 +1688,9 @@ class Optimizer:
                 for i, slots in beyond.items():
                     self._curve_exact_slots[i] |= slots
                 self.create_model()
+                for var in self._managed_load_switches():
+                    if var.name in switches:
+                        var.lowBound = var.upBound = switches[var.name]
                 solver.timeLimit = remaining if own_limit is None else min(own_limit, remaining)
                 self.problem.solve(solver)
                 if pulp.LpStatus[self.problem.status] != 'Optimal':
@@ -1685,6 +1699,12 @@ class Optimizer:
                     return
         finally:
             solver.timeLimit = own_limit
+
+    def _managed_load_switches(self):
+        """The managed loads' on/off and start binaries of the current model."""
+        for key in ('ml_on', 'ml_start'):
+            for per_load in (self.variables.get(key) or {}).values():
+                yield from per_load or ()
 
     @staticmethod
     def _warn_curve_not_refined(beyond, budget):
