@@ -1525,7 +1525,26 @@ _ALL_FIELDS: list[FieldDef] = [
             "(local_evopt) also plans with it. Never limits discharging"
         ),
         labels=["restart_required"],
-        help_url="config-battery.html#battery",
+        help_url="config-battery.html#charging-curve",
+        display_group="Charging",
+    ),
+    FieldDef(
+        key="battery.charging_curve_points",
+        field_type="str",
+        default="",
+        section="battery",
+        level="standard",
+        description=(
+            "Your battery's own charging curve as SOC:power points, e.g. "
+            "'0:6000, 90:6000, 95:3000, 100:800' (power in W, kW, or in % of the "
+            "maximum charge power: '90:100%, 100:15%'). Interpolated in between and "
+            "held flat outside. Used for the live charge limit and, with the built-in "
+            "optimizer, for the plan. Empty = built-in curve (full power to 50 %, then "
+            "a steady taper)"
+        ),
+        labels=["restart_required"],
+        help_url="config-battery.html#charging-curve",
+        depends_on={"battery.charging_curve_enabled": [True]},
         display_group="Charging",
     ),
     FieldDef(

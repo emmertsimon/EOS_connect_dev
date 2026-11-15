@@ -80,6 +80,20 @@
                         <li><strong>Discharging</strong> is never limited by the curve. The planned
                             discharge limit is <code>battery.max_charge_power_w</code>.</li>
                     </ul>
+                    <p><strong>Your battery's own curve.</strong> Many home batteries hold full power far
+                        beyond 50&nbsp;% and then drop hard near full. Enter the points from the
+                        datasheet or from your own measurements in <code>battery.charging_curve_points</code>
+                        as <code>SOC:power</code> pairs &mdash; for example
+                        <code>0:6000, 90:6000, 91:3200, 93:1600, 95:1000, 98:500</code>. Power can be
+                        given in W, in kW (<code>95:1.5kW</code>) or in % of
+                        <code>battery.max_charge_power_w</code> (<code>90:100%, 100:15%</code>). Between
+                        two points the power is interpolated in a straight line, before the first and
+                        after the last it is held flat, so you only need the points where something
+                        changes. Write a decimal comma? Then separate the points with semicolons or line
+                        breaks. The points replace the built-in formula everywhere it is used &mdash; the
+                        live limit, the plan and the temperature derating on top &mdash; and the 500&nbsp;W
+                        floor does not apply to them: they say exactly what the battery takes. A value
+                        that does not parse is refused on save, with the offending point named.</p>
                 </div>
 
                 <div class="content-section" data-level="standard">

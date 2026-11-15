@@ -1168,3 +1168,66 @@ def test_there_is_no_planning_curve_when_it_is_disabled(default_config):
     with patch.object(BatteryInterface, "start_update_service", return_value=None):
         bi = BatteryInterface(default_config)
     assert bi.charge_curve_for_planning() is None
+
+
+# ============================================================================
+# Charging curve from user points
+# ============================================================================
+
+
+@contextmanager
+def _battery(default_config, **overrides):
+    config = dict(default_config, **overrides)
+    with patch.object(BatteryInterface, "start_update_service", return_value=None):
+        bi = BatteryInterface(config)
+        try:
+            yield bi
+        finally:
+            bi._update_thread = None
+
+
+@pytest.mark.parametrize(
+    "soc, expected",
+    [(10, 3000), (85, 3000), (92.5, 1800), (95, 600), (100, 300)],
+)
+def test_user_points_set_the_live_limit(default_config, soc, expected):
+    """Interpolated between the points, rounded to 50 W, and no 500 W floor."""
+    with _battery(default_config, charging_curve_points="0:3000, 90:3000, 95:600, 100:300") as bi:
+        bi.current_soc = soc
+        bi._BatteryInterface__get_max_charge_power_dyn()
+        assert bi.max_charge_power_dyn == expected
+
+
+def test_user_points_are_derated_by_temperature(default_config):
+    with _battery(default_config, charging_curve_points="0:3000, 100:3000") as bi:
+        bi.current_soc = 50
+        bi.current_temp = 2.0  # 0-5 C: flat 50 %
+        bi._BatteryInterface__get_max_charge_power_dyn()
+        assert bi.max_charge_power_dyn == 1500
+
+
+def test_points_that_do_not_parse_fall_back_to_the_builtin_curve(default_config, caplog):
+    with caplog.at_level("WARNING"):
+        with _battery(default_config, charging_curve_points="90:3000, 150:10") as bi:
+            assert bi.charging_curve_points == []
+            bi.current_soc = 100
+            bi._BatteryInterface__get_max_charge_power_dyn()
+            assert bi.max_charge_power_dyn == 500  # 0.05 C of 10 kWh, the old floor
+    assert "charging_curve_points ignored" in caplog.text
+
+
+def test_the_plan_reads_the_same_points_as_the_live_limit(default_config):
+    """One function for both: the plan's curve is the live limit at every SOC."""
+    with _battery(default_config, charging_curve_points="0:3000, 90:3000, 100:300") as bi:
+        bi.current_temp = 8.5  # halfway up the 5-12 C ramp
+        curve = bi.charge_curve_for_planning()
+        for soc in (0, 50, 90, 92.5, 95, 99, 100):
+            assert curve(soc) == bi.charge_power_limit_w(soc, 8.5)
+        assert curve(95) < curve(90)
+        assert curve(100) < 500  # no floor under user points
+
+
+def test_with_the_curve_off_the_plan_gets_none_even_with_points(default_config):
+    with _battery(default_config, charging_curve_enabled=False,
+                  charging_curve_points="0:3000, 100:300") as bi:
+        assert bi.charge_curve_for_planning() is None
