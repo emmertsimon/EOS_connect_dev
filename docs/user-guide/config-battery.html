@@ -93,8 +93,12 @@
                         which keeps the solve as fast as without a curve but lets the plan expect the
                         last few percent sooner than they arrive &mdash; the log says by how much.
                         <code>eos.local_evopt_exact_charging_curve</code> plans such a curve exactly
-                        instead (up to three stretches; more are merged where it matters least), at the
-                        price of solves that take seconds rather than a fraction of one. The live limit
+                        instead, at the price of solves that take seconds rather than a fraction of one.
+                        Up to three stretches are kept as they are; more are merged where it costs the
+                        least charging time, and a merged stretch is planned slightly <em>under</em> the
+                        curve, never above it. The exact rounds share a time budget (four times the
+                        first solve, at least 5&nbsp;s): should they run out, the envelope plan stands
+                        and the log says so. The live limit
                         always follows the points exactly. The external EVopt service and the EOS server
                         take one fixed maximum: with those only the live limit follows the curve.</p>
                     <div data-schema-section="battery" data-schema-anchor="charging-curve"></div>

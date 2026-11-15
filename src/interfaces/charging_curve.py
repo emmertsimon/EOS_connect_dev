@@ -301,12 +301,43 @@ def envelope_exact_up_to(points, tolerance_w=1e-6):
     return 100.0
 
 
-def _hull_lines(points):
-    """Segment lines of the concave hull of *points* (which span one piece)."""
-    hull = concave_envelope(points)
-    if len(hull) == 1:
-        return [(hull[0][0], hull[0][1], 0.0)]
-    return [(s0, p0, (p1 - p0) / (s1 - s0)) for (s0, p0), (s1, p1) in zip(hull, hull[1:])]
+def _support_line(inside, grid, truth):
+    """
+    The one line under the curve across *inside* that costs the least charging time.
+
+    *inside* are the curve's points spanning a merged piece. The line may touch the
+    curve but never rise above it, and it stays at or above zero across the piece -
+    a negative power there would forbid the state of charge itself, not only the
+    charge. Candidates are the lines through two of the points, the flat line
+    through each, and lines pivoting at each point between its two neighbouring
+    slopes; the one losing the least time over *grid* (against *truth*) wins.
+    Returns ``[(soc_anchor, power, slope_w_per_percent)]``.
+    """
+    lo, hi = inside[0][0], inside[-1][0]
+    candidates = set()
+    for s0, p0 in inside:
+        candidates.add((s0, p0, 0.0))
+        for s1, p1 in inside:
+            if s1 > s0:
+                candidates.add((s0, p0, (p1 - p0) / (s1 - s0)))
+    for (sa, pa), (sb, pb), (sc, pc) in zip(inside, inside[1:], inside[2:]):
+        left, right = (pb - pa) / (sb - sa), (pc - pb) / (sc - sb)
+        for step in range(1, 20):
+            candidates.add((sb, pb, left + (right - left) * step / 20))
+    best = None
+    for s0, p0, slope in sorted(candidates):
+        if any(p0 + slope * (soc - s0) > power + 1e-6 for soc, power in inside):
+            continue
+        if min(p0 + slope * (lo - s0), p0 + slope * (hi - s0)) < -1e-9:
+            continue
+        lost = sum(
+            1.0 / max(p0 + slope * (soc - s0), 1e-6) - 1.0 / power
+            for soc, power in zip(grid, truth)
+            if lo <= soc <= hi
+        )
+        if best is None or lost < best[0]:
+            best = (lost, (s0, p0, slope))
+    return [best[1]]
 
 
 def _piece_value(pieces, soc):
@@ -324,18 +355,19 @@ def limited_pieces(points, max_pieces):
 
     Every extra piece costs the solver a binary per slot, and the solve time grows
     quickly with it. When the curve has more upward bends than that, neighbouring
-    pieces are merged and each merged piece follows the concave hull of its points -
-    generous inside, like the envelope, but only there. The cuts kept are the ones
-    that best preserve how long the battery takes to fill: the error is measured as
-    charging time over the stretches the merge touches.
+    pieces are merged, and a merged piece follows a single line that stays *under*
+    the curve throughout (see :func:`_support_line`): a plan may then count on a
+    little less than the battery would take, never on more. Pieces left unmerged
+    keep their exact lines. The cuts kept are the ones that lose the least charging
+    time over the stretch above the point where the envelope stops being exact.
     """
     exact = concave_pieces(points)
     if max_pieces < 1 or len(exact) <= max_pieces:
         return exact
     pts = full_range_points(points)
     cuts = [lo for lo, _, _ in exact[1:]]
-    # Merging can only make the curve more generous where it bends upward, which
-    # starts where the envelope stops being exact.
+    unmerged = {(lo, hi): lines for lo, hi, lines in exact}
+    # Below the first upward bend the curve is one concave piece and stays exact.
     start = envelope_exact_up_to(points)
     grid = [start + (100.0 - start) * (j + 0.5) / 400 for j in range(400)]
     truth = [max(curve_power_at(pts, soc), 1e-6) for soc in grid]
@@ -344,13 +376,16 @@ def limited_pieces(points, max_pieces):
         bounds = [0.0] + list(kept) + [100.0]
         pieces = []
         for lo, hi in zip(bounds, bounds[1:]):
+            if (lo, hi) in unmerged:
+                pieces.append((lo, hi, unmerged[(lo, hi)]))
+                continue
             inside = [(soc, w) for soc, w in pts if lo - 1e-9 <= soc <= hi + 1e-9]
-            pieces.append((lo, hi, _hull_lines(inside)))
+            pieces.append((lo, hi, _support_line(inside, grid, truth)))
         return pieces
 
     def lost_time(pieces):
         return sum(
-            1.0 / w - 1.0 / max(_piece_value(pieces, soc), 1e-6)
+            1.0 / max(_piece_value(pieces, soc), 1e-6) - 1.0 / w
             for soc, w in zip(grid, truth)
         )
 

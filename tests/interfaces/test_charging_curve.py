@@ -192,9 +192,26 @@ def test_the_envelope_is_exact_up_to_the_first_upward_bend():
 def test_merging_keeps_the_cuts_that_best_preserve_the_charging_time():
     points = parse_curve_points(SIMON, MAX_W)
     merged = limited_pieces(points, 3)
-    assert [(lo, hi) for lo, hi, _ in merged] == [(0.0, 93.0), (93.0, 98.0), (98.0, 100.0)]
-    # A merged piece follows the hull of its points: generous inside, never below.
-    for soc in (91, 92, 94, 95, 97):
+    assert [(lo, hi) for lo, hi, _ in merged] == [(0.0, 91.0), (91.0, 98.0), (98.0, 100.0)]
+    # Unmerged pieces keep their exact lines ...
+    assert merged[0][2] == concave_pieces(points)[0][2]
+    # ... and a merged one runs under the curve: a plan may count on a little less
+    # than the battery takes, never on more - and never on less than nothing.
+    for tenth in range(900, 1001):
+        soc = tenth / 10
         lo, hi, lines = next(p for p in merged if p[0] <= soc <= p[1])
-        assert min(p0 + k * (soc - s0) for s0, p0, k in lines) >= curve_power_at(points, soc) - 1e-6
+        planned = min(p0 + k * (soc - s0) for s0, p0, k in lines)
+        assert 0.0 <= planned <= curve_power_at(points, soc) + 1e-6, soc
     assert limited_pieces(points, 9) == concave_pieces(points)
+
+
+def test_a_merged_piece_down_to_zero_at_full_still_allows_sitting_there():
+    """A curve ending at 0 W: the merged line may reach zero at 100 %, not go below."""
+    points = parse_curve_points("0:5000, 85:5000, 88:1500, 92:900, 96:600, 100:0", 5000)
+    merged = limited_pieces(points, 2)
+    lo, hi, lines = merged[-1]
+    assert hi == 100.0
+    for tenth in range(int(lo * 10), 1001):
+        soc = tenth / 10
+        planned = min(p0 + k * (soc - s0) for s0, p0, k in lines)
+        assert -1e-9 <= planned <= curve_power_at(points, soc) + 1e-6, soc
