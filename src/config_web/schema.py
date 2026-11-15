@@ -926,6 +926,25 @@ _ALL_FIELDS: list[FieldDef] = [
         hot_reload=True,
     ),
     FieldDef(
+        key="eos.local_evopt_exact_charging_curve",
+        field_type="bool",
+        default=False,
+        section="eos",
+        level="expert",
+        description=(
+            "Plan the charging curve inside the solver, at each slot's average state "
+            "of charge, instead of adjusting per-slot limits around it. Exact for "
+            "curves with a hard knee (e.g. full power to 90 %, then a steep drop), "
+            "which the default reads at the start of each slot and can overrate by "
+            "the whole drop. Slots that reach the top cost extra binaries; the extra "
+            "solving is capped at four times the plain solve (at least 5 s)"
+        ),
+        labels=["restart_required"],
+        help_url="config-battery.html#charging-curve",
+        depends_on={"eos.source": "local_evopt"},
+        display_group="Local Optimizer",
+    ),
+    FieldDef(
         key="eos.local_evopt_terminal_soc_value",
         field_type="select",
         default="cheapest_ahead",

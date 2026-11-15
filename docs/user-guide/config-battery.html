@@ -94,6 +94,19 @@
                         live limit, the plan and the temperature derating on top &mdash; and the 500&nbsp;W
                         floor does not apply to them: they say exactly what the battery takes. A value
                         that does not parse is refused on save, with the offending point named.</p>
+                    <p><strong>Exact planning near full.</strong> By default the built-in optimizer reads
+                        the curve at the state of charge each slot starts at. For a gentle curve that is
+                        close enough; at a hard knee it is not: a quarter hour that starts at 89.9&nbsp;%
+                        is planned at full power and ends near 99&nbsp;%, while the battery drops to a
+                        fraction at 91&nbsp;%. <code>eos.local_evopt_exact_charging_curve</code> plans the
+                        curve inside the solver instead, at each slot's average state of charge, so no
+                        slot counts on more than the battery takes. A curve that flattens again after
+                        the drop is cut into up to three stretches; more are merged where it costs the
+                        least charging time, and a merged stretch is planned slightly <em>under</em> the
+                        curve, never above it. Only slots that reach the top get the extra decisions,
+                        managed loads stay where the first solve put them, and the extra solving is
+                        capped at four times the plain solve (at least 5&nbsp;s): should it run out, the
+                        plain plan stands and the log says so.</p>
                 </div>
 
                 <div class="content-section" data-level="standard">

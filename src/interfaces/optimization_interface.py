@@ -105,6 +105,9 @@ class OptimizationInterface:
                 terminal_soc_value=_terminal_soc_value,
                 max_grid_import_w=_max_imp,
                 max_grid_export_w=_max_exp,
+                exact_charging_curve=bool(
+                    config.get("local_evopt_exact_charging_curve", False)
+                ),
             )
             self.backend_type = "local_evopt"
             logger.info(

@@ -19,8 +19,16 @@ from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
 )
+from ..charging_curve import (
+    ChargingCurveError,
+    concave_pieces,
+    envelope_exact_up_to,
+    envelope_segments,
+    limited_pieces,
+)
 from .local_evopt.optimizer import (
     BatteryConfig,
+    ChargeCurveConfig,
     CbcSolverUnavailableError,
     GridConfig,
     ManagedLoadConfig,
@@ -91,6 +99,7 @@ class LocalEVOptBackend(EVOptBackend):
         terminal_soc_value=DEFAULT_TERMINAL_SOC_VALUE,
         max_grid_import_w=None,
         max_grid_export_w=None,
+        exact_charging_curve=False,
     ):
         # base_url is not used in-process; pass a placeholder so parent __init__ is happy
         super().__init__(
@@ -112,6 +121,11 @@ class LocalEVOptBackend(EVOptBackend):
         self.emergency_reserve_pct = max(0, min(80, int(emergency_reserve_pct or 0)))
         self.max_grid_import_w = max_grid_import_w
         self.max_grid_export_w = max_grid_export_w
+        # Plan a charging curve that comes with points inside the model, at each slot's
+        # average SOC, instead of iterating per-slot limits around the solver (see
+        # _solve_with_exact_curve).
+        self.exact_charging_curve = bool(exact_charging_curve)
+        self._exact_curve_points = None  # curve points of the run in progress, logged once
         # Initialize rolling average runtime tracking (5-element circular buffer)
         self.last_optimization_runtimes = [0.0] * 5
         self.last_optimization_runtime_number = 0
@@ -131,6 +145,11 @@ class LocalEVOptBackend(EVOptBackend):
 
     # Plans the battery's charging curve slot by slot; see optimize().
     plans_charging_curve = True
+
+    # A curve with more upward bends than this is merged down to it (see
+    # charging_curve.limited_pieces): each piece is a binary per slot that reaches the
+    # top, and three keep a two-day quarter-hourly solve at a few seconds.
+    MAX_CHARGE_CURVE_PIECES = 3
 
     def optimize(self, eos_request, timeout=180, managed_loads=None,
                  managed_load_budget_w=0.0, charge_power_limit=None):
@@ -280,6 +299,14 @@ class LocalEVOptBackend(EVOptBackend):
         if charge_power_limit is None:
             return build_and_solve(None)
 
+        points = getattr(charge_power_limit, "points", None)
+        if getattr(self, "exact_charging_curve", False) and points:
+            exact = self._solve_with_exact_curve(
+                evopt_request, timeout, loads, managed_load_budget_w, points
+            )
+            if exact is not None:
+                return exact
+
         pv_akku = eos_request.get("pv_akku") or {}
         capacity_wh = float(pv_akku.get("capacity_wh", 0) or 0)
         initial_soc = float(pv_akku.get("initial_soc_percentage", 0) or 0)
@@ -331,6 +358,81 @@ class LocalEVOptBackend(EVOptBackend):
             result = candidate
         return result
 
+    def _solve_with_exact_curve(self, evopt_request, timeout, loads,
+                                managed_load_budget_w, points):
+        """
+        Plan the curve inside the model: one solve, with re-solves only near full.
+
+        Every slot's charge is held under the curve at the slot's *average* SOC - the
+        mean of where it starts and where it ends - which stays linear because the
+        slot's own charge sits on both sides. Reading the curve at the start of a slot
+        instead lets a slot that starts just below a hard knee (90 % -> 3 kW at 91 %)
+        plan full power all the way through it. A curve that bends upward somewhere is
+        cut into concave pieces with a binary per piece, only in the slots that reach
+        the top; see Optimizer._add_charge_curve_constraints and solve().
+
+        Returns ``(optimizer, evopt_response)``, or None when the points give no usable
+        curve - the caller then iterates per-slot limits as usual.
+        """
+        bats = evopt_request.get("batteries") or []
+        s_capacity = float(bats[0].get("s_capacity") or bats[0].get("s_max") or 0) if bats else 0.0
+        curve = self._charge_curve_config(points, s_capacity)
+        if curve is None:
+            return None
+        if points != self._exact_curve_points:
+            self._exact_curve_points = list(points)
+            logger.info(
+                "[OPT-LocalEVopt] Charging curve planned exactly at each slot's average "
+                "SOC: %s%s",
+                ", ".join(f"{soc:g}%:{power:.0f}W" for soc, power in points),
+                self._curve_note(points),
+            )
+        optimizer = self._build_optimizer(
+            evopt_request, timeout, loads,
+            managed_load_budget_w=managed_load_budget_w, charge_curve=curve,
+        )
+        return optimizer, optimizer.solve()
+
+    def _curve_note(self, points):
+        """What the log should add about how the curve is cut for the solver."""
+        try:
+            stretches = len(concave_pieces(points))
+        except ChargingCurveError:
+            return ""
+        if stretches <= 1:
+            return " (concave: linear in every slot)"
+        if stretches > self.MAX_CHARGE_CURVE_PIECES:
+            return (
+                f" (merged from {stretches} to {self.MAX_CHARGE_CURVE_PIECES} stretches"
+                f" to keep the solve fast - planned slightly under the curve where"
+                f" merged, never above it)"
+            )
+        return f" ({stretches} stretches)"
+
+    def _charge_curve_config(self, points, s_capacity):
+        """The curve in the solver's units - Wh of state of charge - or None."""
+        if not points or s_capacity <= 0:
+            return None
+        try:
+            envelope = envelope_segments(points)
+            pieces = limited_pieces(points, self.MAX_CHARGE_CURVE_PIECES)
+            exact_up_to = envelope_exact_up_to(points)
+        except ChargingCurveError:
+            return None
+        per_wh = 100.0 / s_capacity
+
+        def wh(soc):
+            return soc / 100.0 * s_capacity
+
+        def lines_in_wh(lines):
+            return [(wh(soc), power, slope * per_wh) for soc, power, slope in lines]
+
+        return ChargeCurveConfig(
+            pieces=[(wh(lo), wh(hi), lines_in_wh(lines)) for lo, hi, lines in pieces],
+            envelope=lines_in_wh(envelope),
+            envelope_exact_below=wh(exact_up_to),
+        )
+
     @staticmethod
     def _is_solved(evopt_response):
         status = evopt_response.get("status", "")
@@ -353,7 +455,7 @@ class LocalEVOptBackend(EVOptBackend):
         return [charge_power_limit(soc) for soc in starts]
 
     def _build_optimizer(self, evopt_request, timeout, managed_loads=None,
-                         managed_load_budget_w=0.0, c_max_series=None):
+                         managed_load_budget_w=0.0, c_max_series=None, charge_curve=None):
         """Construct the Optimizer object from an EVopt-format request dict."""
         # Use configured strategies (may override what the transformation put in)
         strategy = OptimizationStrategy(
@@ -411,6 +513,7 @@ class LocalEVOptBackend(EVOptBackend):
                 c_priority=int(bat_data.get("c_priority", 0)),
                 s_reserve=s_reserve_wh,
                 c_max_series=c_max_series,
+                charge_curve=charge_curve,
             ))
 
         ts_data = evopt_request.get("time_series", {})
