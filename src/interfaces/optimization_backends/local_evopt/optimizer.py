@@ -51,7 +51,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pulp
@@ -231,6 +231,12 @@ class BatteryConfig:
     c_priority: int = 0
     # Emergency reserve: minimum end-of-horizon SOC in Wh (EOS_connect extension)
     s_reserve: float = 0.0
+    # SOC-dependent charge limit (EOS_connect extension): lines
+    # ``(s_anchor_wh, power_w, slope_w_per_wh)``, each an upper bound on the charge
+    # power as a function of the slot's average state of charge,
+    # ``power_w + slope_w_per_wh * (s_avg - s_anchor_wh)``. Pass the segments of a
+    # concave curve - its minimum over the lines is then the curve itself.
+    charge_limits: Optional[List[Tuple[float, float, float]]] = None
 
     def __post_init__(self):
         if self.s_capacity is None:
@@ -906,6 +912,9 @@ class Optimizer:
                     - (1 / self.eta_d) * self.variables['d'][i][t]
                 )
 
+            if bat.charge_limits:
+                self._add_charge_curve_constraints(i, bat)
+
             # SOC goal constraints (for t > 0)
             if bat.s_goal is not None:
                 for t in range(1, self.T):
@@ -996,6 +1005,41 @@ class Optimizer:
                 self.problem += (
                     self.variables['s'][i][self.T - 1] + self.variables['s_reserve_pen'][i]
                     >= bat.s_reserve
+                )
+
+    def _add_charge_curve_constraints(self, i, bat):
+        """
+        Hold each slot's charge under the battery's charging curve (EOS_connect extension).
+
+        The curve is read at the slot's *average* state of charge - the mean of where
+        it starts and where it ends - rather than at its start. At the steep end of a
+        curve one 15-minute slot can move the battery several percent, and judging
+        the whole slot by its first moment would plan more than the BMS lets in. The
+        average is still linear in the variables: ``s[t]`` already contains this
+        slot's charge, so the charge simply appears on both sides.
+
+        A line that stays at or above ``c_max`` across the whole state of charge range
+        can never bind and is not added.
+        """
+        cap = float(bat.s_capacity or 0.0)
+        lines = []
+        for s_anchor, power, slope in bat.charge_limits:
+            at_empty = power + slope * (0.0 - s_anchor)
+            at_full = power + slope * (cap - s_anchor)
+            if min(at_empty, at_full) >= bat.c_max:
+                continue
+            lines.append((float(s_anchor), float(power), float(slope)))
+        if not lines:
+            return
+
+        for t in self.time_steps:
+            dt_h = self.time_series.dt[t] / 3600.0
+            s_start = bat.s_initial if t == 0 else self.variables['s'][i][t - 1]
+            s_avg = 0.5 * (s_start + self.variables['s'][i][t])
+            for s_anchor, power, slope in lines:
+                self.problem += (
+                    self.variables['c'][i][t]
+                    <= dt_h * (power + slope * (s_avg - s_anchor))
                 )
 
     def _add_managed_load_constraints(self):

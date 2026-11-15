@@ -1128,3 +1128,76 @@ class TestAnUnreadableSensorDoesNotKillTheUpdateThread:
                 bi._update_state_loop()
 
         assert len(cycles) == 2, "the loop must run again after an unexpected error"
+
+
+# ============================================================================
+# Charging curve from user points
+# ============================================================================
+
+
+@contextmanager
+def _battery(default_config, **overrides):
+    config = dict(default_config, **overrides)
+    with patch.object(BatteryInterface, "start_update_service", return_value=None):
+        bi = BatteryInterface(config)
+        try:
+            yield bi
+        finally:
+            bi._update_thread = None
+
+
+@pytest.mark.parametrize(
+    "soc, expected",
+    [(10, 3000), (85, 3000), (92.5, 1800), (95, 600), (100, 300)],
+)
+def test_user_points_set_the_live_limit(default_config, soc, expected):
+    """Interpolated between the points, rounded to 50 W, and no 500 W floor."""
+    with _battery(default_config, charging_curve_points="0:3000, 90:3000, 95:600, 100:300") as bi:
+        bi.current_soc = soc
+        bi._BatteryInterface__get_max_charge_power_dyn()
+        assert bi.max_charge_power_dyn == expected
+
+
+def test_user_points_are_derated_by_temperature(default_config):
+    with _battery(default_config, charging_curve_points="0:3000, 100:3000") as bi:
+        bi.current_soc = 50
+        bi.current_temp = 2.0  # 0-5 C: flat 50 %
+        bi._BatteryInterface__get_max_charge_power_dyn()
+        assert bi.max_charge_power_dyn == 1500
+
+
+def test_points_that_do_not_parse_fall_back_to_the_builtin_curve(default_config, caplog):
+    with caplog.at_level("WARNING"):
+        with _battery(default_config, charging_curve_points="90:3000, 150:10") as bi:
+            assert bi.charging_curve_points == []
+            bi.current_soc = 100
+            bi._BatteryInterface__get_max_charge_power_dyn()
+            assert bi.max_charge_power_dyn == 500  # 0.05 C of 10 kWh, the old floor
+    assert "charging_curve_points ignored" in caplog.text
+
+
+def test_the_plan_gets_the_user_points_derated_like_the_live_limit(default_config):
+    with _battery(default_config, charging_curve_points="0:3000, 90:3000, 100:300") as bi:
+        bi.current_temp = 8.5  # halfway up the 5-12 C ramp
+        multiplier = bi._BatteryInterface__calculate_temp_multiplier(8.5)
+        assert bi.get_charge_curve_for_planning() == [
+            (0.0, pytest.approx(3000 * multiplier)),
+            (90.0, pytest.approx(3000 * multiplier)),
+            (100.0, pytest.approx(300 * multiplier)),
+        ]
+
+
+def test_without_points_the_plan_gets_the_builtin_curve(default_config):
+    from src.interfaces.charging_curve import builtin_power_at
+
+    with _battery(default_config) as bi:
+        curve = bi.get_charge_curve_for_planning()
+        assert curve[0] == (0.0, 3000.0)
+        for soc, power in curve:
+            assert power == pytest.approx(builtin_power_at(soc, 3000, 10000))
+
+
+def test_with_the_curve_off_the_plan_gets_none(default_config):
+    with _battery(default_config, charging_curve_enabled=False,
+                  charging_curve_points="0:3000, 100:300") as bi:
+        assert bi.get_charge_curve_for_planning() is None

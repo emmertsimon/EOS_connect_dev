@@ -37,6 +37,10 @@ except ImportError:  # imported as src.config_web (tests)
         connection_for,
         ha_entity_connection,
     )
+try:  # running from src/ as a script — src/ is on sys.path
+    from interfaces.charging_curve import validate_curve_text
+except ImportError:  # imported as src.config_web (tests)
+    from ..interfaces.charging_curve import validate_curve_text
 from .timeseries_probe import probe
 
 try:  # running from src/ as a script — src/ is on sys.path
@@ -1705,10 +1709,35 @@ def _validate_updates(data: dict) -> list[dict]:
             continue
 
         err = _validate_single(field_def, value)
+        if not err and field_def.key in _CONTENT_VALIDATORS:
+            err = _CONTENT_VALIDATORS[field_def.key](value, data, current_config)
         if err:
             errors.append({"key": key, "error": err})
 
     return errors
+
+
+def _validate_charging_curve_points(value, data, current_config) -> str:
+    """
+    The points must parse - a curve the battery interface cannot read is dropped
+    there with a warning, so saving one would look like it worked while it did not.
+    """
+    max_power = data.get(
+        "battery.max_charge_power_w",
+        current_config.get("battery", {}).get("max_charge_power_w"),
+    )
+    try:
+        max_power = float(max_power) if max_power not in (None, "") else None
+    except (TypeError, ValueError):
+        max_power = None
+    return validate_curve_text(value, max_power)
+
+
+# Fields whose value is a small language of its own: checked for content after the
+# schema checks pass. Keyed by schema key; each takes (value, incoming, current).
+_CONTENT_VALIDATORS = {
+    "battery.charging_curve_points": _validate_charging_curve_points,
+}
 
 
 def _is_empty(value) -> bool:

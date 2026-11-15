@@ -67,6 +67,36 @@
                 </div>
 
                 <div class="content-section" data-level="standard">
+                    <h2 id="charging-curve"><i class="fas fa-chart-line" aria-hidden="true"></i> How
+                        fast the battery charges when it is nearly full</h2>
+                    <p>No battery takes its full charge power all the way to 100&nbsp;%: the BMS tapers
+                        it as the cells fill. With the charging curve on, EOS Connect lowers the charge
+                        limit it writes to the inverter as the state of charge rises, and the built-in
+                        optimizer plans every slot with the power the battery will really take at the
+                        state of charge it reaches there &mdash; so a plan that needs the battery full by
+                        evening starts early enough.</p>
+                    <p>Without points the built-in curve is used: full power up to 50&nbsp;%, then a
+                        steady taper to 0.05&nbsp;C at the top. Most home batteries hold full power much
+                        longer than that. If yours does, enter its curve as points &mdash; state of charge
+                        against power &mdash; in <code>battery.charging_curve_points</code>, for example</p>
+                    <pre><code>0:6000, 90:6000, 95:3000, 100:800</code></pre>
+                    <p>Power is in watts, or in percent of the maximum charge power
+                        (<code>90:100%, 100:15%</code>); <code>kW</code> works too. Between two points the
+                        power is interpolated in a straight line, before the first and after the last it
+                        is held flat, so you only need the points where something changes. Write a decimal
+                        comma? Then separate the points with semicolons or line breaks.</p>
+                    <p>The battery temperature derating applies on top, to the live limit and to the
+                        plan alike. The plan reads the curve at each slot's average state of charge. It
+                        can only follow a curve exactly where the power falls off ever more steeply
+                        towards full (a concave curve); a stretch that drops hard and then levels off is
+                        planned slightly generously, and the log says by how much. Adding a point in the
+                        middle of such a stretch takes most of that away. The external EVopt service and
+                        the EOS server take one fixed maximum: with those only the live limit follows the
+                        curve.</p>
+                    <div data-schema-section="battery" data-schema-anchor="charging-curve"></div>
+                </div>
+
+                <div class="content-section" data-level="standard">
                     <h2 id="battery-price"><i class="fas fa-coins" aria-hidden="true"></i> What your
                         stored energy cost</h2>
                     <p>EOS Connect can track a running price for the energy in the battery, from what it

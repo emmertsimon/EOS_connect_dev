@@ -198,8 +198,18 @@ class OptimizationInterface:
         """
         return bool(getattr(self.backend, "places_home_appliance", False))
 
+    @property
+    def plans_charge_curve(self):
+        """
+        Whether the backend plans the battery's charging curve slot by slot.
+
+        Read through to the backend like the two above. Only the in-process solver
+        can: the EOS server and the external EVopt service take one fixed maximum.
+        """
+        return bool(getattr(self.backend, "plans_charge_curve", False))
+
     def optimize(self, eos_request, timeout=None, managed_loads=None,
-                 managed_load_budget_w=0.0):
+                 managed_load_budget_w=0.0, battery_charge_curve=None):
         """
         Main entry point for optimization.
         Accepts EOS-format request, returns EOS-format response.
@@ -210,17 +220,21 @@ class OptimizationInterface:
         inside it because that dict is posted verbatim to an EOS server, which
         validates what it is sent. *managed_load_budget_w* travels the same way: it
         belongs to the installation rather than to any one load.
+
+        *battery_charge_curve* is ``[(soc_percent, power_w), ...]`` - the charge power
+        the battery takes at each state of charge - and reaches only a backend that
+        plans it per slot (see :attr:`plans_charge_curve`).
         """
         if timeout is None:
             timeout = self.timeout
         self.last_eos_request = eos_request  # Store for dynamic override logic
+        kwargs = {}
         if managed_loads is not None and self.schedules_managed_loads:
-            eos_response, avg_runtime = self.backend.optimize(
-                eos_request, timeout, managed_loads=managed_loads,
-                managed_load_budget_w=managed_load_budget_w,
-            )
-        else:
-            eos_response, avg_runtime = self.backend.optimize(eos_request, timeout)
+            kwargs["managed_loads"] = managed_loads
+            kwargs["managed_load_budget_w"] = managed_load_budget_w
+        if battery_charge_curve and self.plans_charge_curve:
+            kwargs["battery_charge_curve"] = battery_charge_curve
+        eos_response, avg_runtime = self.backend.optimize(eos_request, timeout, **kwargs)
         return eos_response, avg_runtime
 
     def examine_response_to_control_data(self, optimized_response_in):

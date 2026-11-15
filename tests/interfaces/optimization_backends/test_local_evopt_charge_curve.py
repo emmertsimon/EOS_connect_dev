@@ -1,0 +1,228 @@
+"""
+The battery's charging curve planned slot by slot.
+
+What the user is promised: with the curve on, the plan never counts on the battery
+taking more in a slot than the curve allows at the state of charge it is at - so a
+battery that tapers at 90 % is not planned as if it filled at full power to 100 %.
+The checks read the solved numbers back rather than trusting the constraint.
+"""
+
+from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
+
+import pytest
+
+pulp = pytest.importorskip("pulp")
+
+from src.interfaces.charging_curve import (  # noqa: E402
+    concave_envelope,
+    curve_power_at,
+    full_range_points,
+)
+from src.interfaces.optimization_backends.local_evopt.optimizer import (  # noqa: E402
+    BatteryConfig,
+    GridConfig,
+    Optimizer,
+    OptimizationStrategy,
+    OptimizerSettings,
+    TimeSeriesData,
+)
+from src.interfaces.optimization_backends.optimization_backend_local_evopt import (  # noqa: E402
+    LocalEVOptBackend,
+)
+from src.interfaces.optimization_interface import OptimizationInterface  # noqa: E402
+
+CAP = 10000.0
+C_MAX = 5000.0
+T = 16
+DT = 900  # 15-minute slots: one slot can move this battery up to ~12 %
+ETA = 0.95
+TAPER = [(0.0, 5000.0), (80.0, 5000.0), (100.0, 500.0)]  # concave
+
+
+def _limits(points, cap=CAP):
+    """The curve as the backend hands it to the solver (see `_charge_limits`)."""
+    backend = LocalEVOptBackend.__new__(LocalEVOptBackend)
+    backend._charge_curve = sorted(points)
+    backend._charge_curve_shape = None
+    return backend._charge_limits(cap)
+
+
+def _solve(points=None, s_initial=6000.0, pv_wh=2000.0, sun_slots=T):
+    """
+    Sun for *sun_slots* slots and none after, nothing for exporting it: whatever the
+    battery does not take while the sun shines is lost, so the solver charges as much
+    as it is allowed to, as early as it has to.
+    """
+    battery = BatteryConfig(
+        s_min=500, s_max=CAP, s_initial=s_initial, c_max=C_MAX, d_max=C_MAX,
+        p_a=0.0003, charge_from_grid=False, s_capacity=CAP,
+        charge_limits=_limits(points) if points else None,
+    )
+    series = TimeSeriesData(
+        dt=[DT] * T, gt=[100.0] * T,
+        ft=[pv_wh] * sun_slots + [0.0] * (T - sun_slots),
+        p_N=[0.0003] * T, p_E=[0.0] * T,
+    )
+    optimizer = Optimizer(
+        strategy=OptimizationStrategy(), grid=GridConfig(p_max_imp=20000, p_max_exp=20000),
+        batteries=[battery], time_series=series, eta_c=ETA, eta_d=ETA,
+        optimizer_settings=OptimizerSettings(time_limit=60), M=60000,
+    )
+    result = optimizer.solve()
+    assert result["status"] == "Optimal"
+    bat = result["batteries"][0]
+    return bat["charging_power"], bat["state_of_charge"]
+
+
+def _avg_soc_percent(s_initial, soc, t):
+    start = s_initial if t == 0 else soc[t - 1]
+    return 50.0 * (start + soc[t]) / CAP
+
+
+@pytest.mark.parametrize("s_initial", [6000.0, 8500.0, 9500.0])
+def test_no_slot_charges_more_than_the_curve_allows(s_initial):
+    charge, soc = _solve(TAPER, s_initial=s_initial)
+    for t, energy in enumerate(charge):
+        allowed_wh = curve_power_at(TAPER, _avg_soc_percent(s_initial, soc, t)) * DT / 3600
+        assert energy <= allowed_wh + 1e-3, f"slot {t}: {energy:.1f} Wh > {allowed_wh:.1f} Wh"
+
+
+def test_the_taper_slows_the_last_stretch_down():
+    # Two sunny slots of 8 kW: enough to fill the battery from 80 % at full power.
+    tapered, soc_tapered = _solve(TAPER, s_initial=8000.0, sun_slots=2)
+    free, soc_free = _solve(None, s_initial=8000.0, sun_slots=2)
+    # Without the curve the first slot charges at the full 5 kW and the battery is
+    # full by the end of the second ...
+    assert free[0] == pytest.approx(C_MAX * DT / 3600, abs=1.0)
+    assert soc_free[1] == pytest.approx(CAP, abs=1.0)
+    # ... with it, both slots are already into the taper,
+    assert tapered[1] < tapered[0] < C_MAX * DT / 3600 + 1e-6
+    # so less of the sun ends up in the battery.
+    assert soc_tapered[1] < soc_free[1] - 300
+
+
+def test_below_the_knee_the_curve_changes_nothing():
+    """A curve flat at c_max where the battery is cannot cost anything."""
+    charge_curve, soc_curve = _solve(TAPER, s_initial=2000.0, pv_wh=1000.0, sun_slots=4)
+    charge_free, soc_free = _solve(None, s_initial=2000.0, pv_wh=1000.0, sun_slots=4)
+    assert charge_curve[:4] == pytest.approx(charge_free[:4], abs=1e-3)
+    assert soc_curve[-1] == pytest.approx(soc_free[-1], abs=1e-3)
+
+
+def test_a_convex_stretch_is_held_to_its_envelope():
+    """Documented behaviour: a curve that bends upward is planned along its hull."""
+    convex = [(0.0, 5000.0), (90.0, 5000.0), (95.0, 2000.0), (100.0, 1500.0)]
+    hull = concave_envelope(full_range_points(convex))
+    charge, soc = _solve(convex, s_initial=8800.0)
+    for t, energy in enumerate(charge):
+        allowed_wh = curve_power_at(hull, _avg_soc_percent(8800.0, soc, t)) * DT / 3600
+        assert energy <= allowed_wh + 1e-3
+
+
+def test_lines_that_can_never_bind_are_left_out():
+    optimizer_lines = _limits([(0.0, 9000.0), (100.0, 6000.0)])  # always above c_max
+    battery = BatteryConfig(s_capacity=CAP, s_max=CAP, c_max=C_MAX, charge_limits=optimizer_lines)
+    optimizer = MagicMock()
+    optimizer.problem = MagicMock()
+    Optimizer._add_charge_curve_constraints(optimizer, 0, battery)
+    optimizer.problem.__iadd__.assert_not_called()
+
+
+# -- through the backend and the facade ---------------------------------------------------
+
+
+def _eos_request(initial_soc_pct=85, n_slots=192):
+    return {
+        "ems": {
+            "pv_prognose_wh": [1500.0] * n_slots,
+            "strompreis_euro_pro_wh": [0.0003] * n_slots,
+            "einspeiseverguetung_euro_pro_wh": [0.0] * n_slots,
+            "gesamtlast": [100.0] * n_slots,
+            "preis_euro_pro_wh_akku": 0.0002,
+        },
+        "pv_akku": {
+            "device_id": "battery1", "capacity_wh": 10000,
+            "charging_efficiency": 0.95, "discharging_efficiency": 0.95,
+            "max_charge_power_w": 5000, "initial_soc_percentage": initial_soc_pct,
+            "min_soc_percentage": 5, "max_soc_percentage": 100,
+        },
+    }
+
+
+def test_the_backend_hands_the_curve_to_the_solver_as_lines_in_wh():
+    backend = LocalEVOptBackend(time_frame_base=900, time_zone=ZoneInfo("Europe/Berlin"))
+    built = []
+    original = LocalEVOptBackend._build_optimizer
+
+    def spy(self, *args, **kwargs):
+        optimizer = original(self, *args, **kwargs)
+        built.append(optimizer)
+        return optimizer
+
+    with patch.object(LocalEVOptBackend, "_build_optimizer", spy):
+        response, _ = backend.optimize(_eos_request(), battery_charge_curve=TAPER)
+
+    assert "error" not in response
+    limits = built[0].batteries[0].charge_limits
+    # Flat 5000 W from 0 % (anchored at 0 Wh), then -225 W per % from 80 % = -2.25 W/Wh.
+    assert limits == [
+        (0.0, 5000.0, 0.0),
+        (pytest.approx(8000.0), 5000.0, pytest.approx(-2.25)),
+    ]
+
+
+def test_the_backend_plans_without_lines_when_no_curve_is_given():
+    backend = LocalEVOptBackend(time_frame_base=900, time_zone=ZoneInfo("Europe/Berlin"))
+    backend._set_charge_curve(TAPER)
+    backend._set_charge_curve(None)  # the next run without a curve forgets the last one
+    assert backend._charge_limits(10000.0) is None
+
+
+def test_the_local_backend_claims_the_capability_and_the_external_ones_do_not():
+    from src.interfaces.optimization_backends.optimization_backend_eos import EOSBackend
+    from src.interfaces.optimization_backends.optimization_backend_evopt import EVOptBackend
+
+    assert LocalEVOptBackend.plans_charge_curve is True
+    assert getattr(EOSBackend, "plans_charge_curve", False) is False
+    assert getattr(EVOptBackend, "plans_charge_curve", False) is False
+
+
+def _interface(backend):
+    interface = OptimizationInterface.__new__(OptimizationInterface)
+    interface.eos_source = "local_evopt"
+    interface.timeout = 60
+    interface.last_eos_request = None
+    interface.backend = backend
+    backend.optimize.return_value = ({"ac_charge": []}, 1.0)
+    return interface
+
+
+def test_the_facade_passes_the_curve_to_a_backend_that_plans_it():
+    backend = MagicMock()
+    backend.plans_charge_curve = True
+    backend.schedules_managed_loads = False
+    _interface(backend).optimize({"ems": {}}, battery_charge_curve=TAPER)
+    _, kwargs = backend.optimize.call_args
+    assert kwargs["battery_charge_curve"] == TAPER
+
+
+def test_the_facade_never_offers_it_to_a_backend_that_cannot():
+    backend = MagicMock()
+    del backend.plans_charge_curve
+    del backend.schedules_managed_loads
+    _interface(backend).optimize({"ems": {}}, battery_charge_curve=TAPER)
+    backend.optimize.assert_called_once_with({"ems": {}}, 60)
+
+
+def test_a_derated_curve_is_not_announced_again(caplog):
+    backend = LocalEVOptBackend(time_frame_base=900, time_zone=ZoneInfo("Europe/Berlin"))
+    with caplog.at_level("INFO"):
+        backend._set_charge_curve(TAPER)
+        backend._set_charge_curve([(soc, power * 0.77) for soc, power in TAPER])
+        assert caplog.text.count("Planning with the charging curve") == 1
+        backend._set_charge_curve([(0.0, 5000.0), (90.0, 5000.0), (100.0, 500.0)])
+        assert caplog.text.count("Planning with the charging curve") == 2
+    # The derated values are what the solver gets, even when nothing was logged.
+    backend._set_charge_curve([(soc, power * 0.5) for soc, power in TAPER])
+    assert backend._charge_curve[0] == (0.0, 2500.0)
