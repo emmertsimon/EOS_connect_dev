@@ -24,6 +24,7 @@ from src.interfaces.charging_curve import (  # noqa: E402
 from src.interfaces.optimization_backends.local_evopt.optimizer import (  # noqa: E402
     BatteryConfig,
     GridConfig,
+    ManagedLoadConfig,
     Optimizer,
     OptimizationStrategy,
     OptimizerSettings,
@@ -177,6 +178,55 @@ def test_a_round_the_solver_cannot_finish_falls_back_to_the_round_before(monkeyp
     assert soc == pytest.approx(envelope_soc, abs=1e-3)
     assert charge == pytest.approx(envelope_charge, abs=1e-3)
     assert "no exact plan within" in caplog.text
+
+
+def test_the_exact_round_holds_the_managed_loads_where_the_first_solve_put_them(monkeypatch):
+    """
+    A heat pump's runtime blocks are what make a solve slow; the exact round keeps
+    them as placed and only re-plans battery and grid, so it costs a fraction of the
+    first solve. Checked on the model the exact round solves: every switch is pinned
+    to the value the first solve gave it.
+    """
+    battery = BatteryConfig(
+        s_min=500, s_max=CAP, s_initial=9000.0, c_max=C_MAX, d_max=C_MAX,
+        p_a=0.0003, charge_from_grid=False, s_capacity=CAP,
+        charge_curve=_curve(CONVEX, exact=True),
+    )
+    series = TimeSeriesData(
+        dt=[DT] * T, gt=[100.0] * T, ft=[2000.0] * 2 + [0.0] * (T - 2),
+        p_N=[0.0003] * T, p_E=[0.0] * T,
+    )
+    load = ManagedLoadConfig(
+        id="wp", demand_wh=1500.0, max_power_w=1000.0, value_eur_per_wh=0.0005,
+        min_runtime_slots=4, start_cost_eur=0.01,
+    )
+    optimizer = Optimizer(
+        strategy=OptimizationStrategy(), grid=GridConfig(p_max_imp=20000, p_max_exp=20000),
+        batteries=[battery], time_series=series, eta_c=ETA, eta_d=ETA,
+        optimizer_settings=OptimizerSettings(time_limit=60), M=60000,
+        managed_loads=[load],
+    )
+    real_solve = pulp.LpProblem.solve
+    rounds = []
+
+    def record(self, solver=None, **kwargs):
+        switches = list(optimizer._managed_load_switches())
+        rounds.append([(var.name, var.lowBound, var.upBound) for var in switches])
+        result = real_solve(self, solver, **kwargs)
+        rounds[-1] = (rounds[-1], {var.name: round(pulp.value(var)) for var in switches})
+        return result
+
+    monkeypatch.setattr(pulp.LpProblem, "solve", record)
+    result = optimizer.solve()
+    assert result["status"] == "Optimal"
+    assert len(rounds) == 2, "the envelope plan should have needed one exact round"
+    (first_bounds, first_values), (exact_bounds, exact_values) = rounds
+    assert first_values and any(first_values.values()), "the load should run"
+    assert all(lo in (0, None) and hi in (1, None) for _, lo, hi in first_bounds)
+    assert {name: (lo, hi) for name, lo, hi in exact_bounds} == {
+        name: (value, value) for name, value in first_values.items()
+    }
+    assert exact_values == first_values
 
 
 def test_lines_that_can_never_bind_are_left_out():
