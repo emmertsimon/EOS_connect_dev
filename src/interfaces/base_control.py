@@ -68,6 +68,26 @@ def calculate_tgt_dc_charge_power(
     return hard_cap_w
 
 
+def charge_limit_for_mode(
+    overall_state: int,
+    battery_max_charge_w: float,
+    tgt_dc_charge_power_w: float,
+):
+    """The charge limit to hand an inverter that takes one, or None.
+
+    In the modes that apply the DC charge limit it is that limit (battery maximum,
+    PV charge rate and, when enabled, the optimizer's PV charge plan). While
+    charging from the grid it is the battery's own maximum: the grid charge power
+    is already set by the mode command and stays below it. Before the first state
+    is known there is nothing to send.
+    """
+    if overall_state < 0:
+        return None
+    if mode_uses_dc_charge_limit(overall_state):
+        return tgt_dc_charge_power_w
+    return battery_max_charge_w
+
+
 class BaseControl:
     """
     BaseControl is a class that manages the state and demands of a control system.
