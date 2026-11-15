@@ -14,7 +14,12 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta
 
+try:
+    from timeseries_grid import local_midnight
+except ImportError:  # imported as src.interfaces (tests)
+    from ...timeseries_grid import local_midnight
 from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
@@ -24,12 +29,14 @@ from .local_evopt.optimizer import (
     CbcSolverUnavailableError,
     GridConfig,
     ManagedLoadConfig,
+    ThermalStoreConfig,
     OptimizationStrategy,
     Optimizer,
     OptimizerSettings,
     TimeSeriesData,
     probe_cbc_solver,
 )
+from .local_evopt import plan_stability
 
 logger = logging.getLogger("__main__")
 
@@ -91,6 +98,8 @@ class LocalEVOptBackend(EVOptBackend):
         terminal_soc_value=DEFAULT_TERMINAL_SOC_VALUE,
         max_grid_import_w=None,
         max_grid_export_w=None,
+        plan_stability_weight=plan_stability.DEFAULT_WEIGHT,
+        plan_stability_scope=plan_stability.SCOPE_MANAGED_LOADS,
     ):
         # base_url is not used in-process; pass a placeholder so parent __init__ is happy
         super().__init__(
@@ -112,6 +121,11 @@ class LocalEVOptBackend(EVOptBackend):
         self.emergency_reserve_pct = max(0, min(80, int(emergency_reserve_pct or 0)))
         self.max_grid_import_w = max_grid_import_w
         self.max_grid_export_w = max_grid_export_w
+        # Plan stability: hot-reloadable like the strategies above. The memory lives
+        # here because this object outlives every run, the optimizer does not.
+        self.plan_stability_weight = plan_stability_weight
+        self.plan_stability_scope = plan_stability_scope
+        self.plan_memory = plan_stability.PlanMemory(time_frame_base)
         # Initialize rolling average runtime tracking (5-element circular buffer)
         self.last_optimization_runtimes = [0.0] * 5
         self.last_optimization_runtime_number = 0
@@ -187,9 +201,10 @@ class LocalEVOptBackend(EVOptBackend):
             start_time = time.time()
 
             loads = self._managed_load_configs(managed_loads)
+            plan_start = self._plan_start()
             optimizer, evopt_response = self._solve_with_charge_curve(
                 evopt_request, eos_request, timeout, loads,
-                managed_load_budget_w, charge_power_limit,
+                managed_load_budget_w, charge_power_limit, plan_start=plan_start,
             )
 
             elapsed = time.time() - start_time
@@ -222,6 +237,7 @@ class LocalEVOptBackend(EVOptBackend):
                 return self._infeasible_eos_response(evopt_response), avg_runtime
 
             self._write_debug_file(evopt_response, "optimize_response_local_evopt.json")
+            self.plan_memory.remember(plan_start, optimizer.plan_series())
 
             eos_response = self._transform_response_from_evopt_to_eos(
                 evopt_response, evopt_request, eos_request
@@ -261,7 +277,8 @@ class LocalEVOptBackend(EVOptBackend):
     # ------------------------------------------------------------------
 
     def _solve_with_charge_curve(self, evopt_request, eos_request, timeout, loads,
-                                 managed_load_budget_w, charge_power_limit):
+                                 managed_load_budget_w, charge_power_limit,
+                                 plan_start=None):
         """
         Solve once, or - with a charging curve - until the per-slot limits settle.
 
@@ -275,6 +292,10 @@ class LocalEVOptBackend(EVOptBackend):
                 managed_load_budget_w=managed_load_budget_w,
                 c_max_series=c_max_series,
             )
+            if plan_start is not None:
+                # Every run sees the plan the last optimization settled on, so plan
+                # stability weighs the same in each of them (PR #368).
+                self._attach_previous_plan(optimizer, plan_start)
             return optimizer, optimizer.solve()
 
         if charge_power_limit is None:
@@ -351,6 +372,24 @@ class LocalEVOptBackend(EVOptBackend):
         starts = [initial_soc] + [s / capacity_wh * 100.0 for s in planned[: n_slots - 1]]
         starts += [starts[-1]] * (n_slots - len(starts))
         return [charge_power_limit(soc) for soc in starts]
+    def _plan_start(self):
+        """Wall-clock start of solver slot 0: the current slot, as the request does."""
+        params = self._calculate_time_parameters()
+        anchor = local_midnight(self.time_zone, datetime.now(self.time_zone))
+        return anchor + timedelta(seconds=params["current_slot"] * self.time_frame_base)
+
+    def _attach_previous_plan(self, optimizer, plan_start):
+        """Hand the optimizer the last plan, lined up with this one - see plan_stability."""
+        scope = self.plan_stability_scope
+        if scope not in plan_stability.SCOPES:
+            scope = plan_stability.SCOPE_MANAGED_LOADS
+        optimizer.plan_stability_scope = scope
+        optimizer.plan_stability_weight = (
+            0.0 if scope == plan_stability.SCOPE_OFF
+            else max(0.0, float(self.plan_stability_weight or 0.0))
+        )
+        if optimizer.plan_stability_weight > 0:
+            optimizer.previous_plan = self.plan_memory.previous(plan_start, optimizer.T)
 
     def _build_optimizer(self, evopt_request, timeout, managed_loads=None,
                          managed_load_budget_w=0.0, c_max_series=None):
@@ -507,7 +546,8 @@ class LocalEVOptBackend(EVOptBackend):
                     entry.get("id"),
                 )
                 continue
-            if power <= 0 or demand <= 0:
+            store = self._solver_store(entry.get("store"))
+            if power <= 0 or (demand <= 0 and store is None):
                 continue
 
             mask = entry.get("feasible")
@@ -527,6 +567,9 @@ class LocalEVOptBackend(EVOptBackend):
                 committed_on_slots=max(0, int(entry.get("committed_on_slots", 0) or 0)),
                 already_running=bool(entry.get("already_running", False)),
                 committed_off_slots=max(0, int(entry.get("committed_off_slots", 0) or 0)),
+                efficiency=self._solver_efficiency(entry.get("efficiency")),
+                exclusive_group=str(entry.get("exclusive_group", "") or "").strip(),
+                store=store,
             ))
         if configs:
             logger.debug(
@@ -534,6 +577,54 @@ class LocalEVOptBackend(EVOptBackend):
                 len(configs), ", ".join(c.id for c in configs),
             )
         return configs
+
+    def _solver_store(self, store):
+        """
+        A store planned by temperature, in solver space, or None.
+
+        Its per-slot physics makes the same trip as everything else indexed by slot. A
+        store that cannot be read is dropped back to the ordinary demand rather than
+        failing the solve: the record still carries its amount.
+        """
+        if not isinstance(store, dict):
+            return None
+        try:
+            capacity = float(store.get("capacity_wh_per_k") or 0)
+            if capacity <= 0:
+                return None
+            series = {
+                key: self.to_solver_slots([float(v) for v in store.get(key) or []])
+                for key in ("loss_w_per_k", "ambient_c", "cop", "gain_wh")
+            }
+            return ThermalStoreConfig(
+                capacity_wh_per_k=capacity,
+                t_initial=float(store["t_initial"]),
+                t_min=float(store["t_min"]),
+                t_max=float(store["t_max"]),
+                t_target=(
+                    float(store["t_target"]) if store.get("t_target") is not None
+                    else None
+                ),
+                **series,
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "[OPT-LocalEVopt] unreadable thermal store - falling back to the "
+                "load's energy demand, and where it has none the load is left to "
+                "plan itself this cycle"
+            )
+            return None
+
+    def _solver_efficiency(self, series):
+        """An efficiency series in solver space, or None for a load without one."""
+        if not series:
+            return None
+        try:
+            values = [float(value) for value in series]
+        except (TypeError, ValueError):
+            logger.warning("[OPT-LocalEVopt] unreadable efficiency series - ignoring it")
+            return None
+        return self.to_solver_slots(values, fill=1.0)
 
     def _managed_load_cost(self, optimizer, evopt_request, evopt_response, timeout):
         """
@@ -639,8 +730,6 @@ class LocalEVOptBackend(EVOptBackend):
         Returns:
             Modified evopt_request with extended time_series arrays
         """
-        from datetime import datetime
-
         ts = evopt_request.get("time_series", {})
         ft = ts.get("ft", [])
         dt = ts.get("dt", [])
