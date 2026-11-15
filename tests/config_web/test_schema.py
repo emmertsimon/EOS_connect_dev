@@ -174,6 +174,7 @@ class TestConfigSchema:
             "inverter.charge_from_grid",
             "inverter.avoid_discharge",
             "inverter.discharge_allowed",
+            "inverter.charge_limit",
         ):
             field = self.schema.get(key)
             assert field.depends_on == {"inverter.type": ["homeassistant"]}, key

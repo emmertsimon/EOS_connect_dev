@@ -33,6 +33,7 @@ from timeseries_grid import local_midnight
 from interfaces.base_control import (
     BaseControl,
     calculate_tgt_dc_charge_power,
+    charge_limit_for_mode,
     mode_uses_dc_charge_limit,
 )
 from interfaces.optimization_backends.optimization_backend_eos_genetic import (
@@ -2170,6 +2171,17 @@ def change_control_state():
     state_changed = base_control.was_overall_state_changed_recently(consume=True)
     current_overall_state = base_control.get_current_overall_state_number()
     current_overall_state_text = base_control.get_current_overall_state()
+
+    # An inverter that takes a separate charge limit gets it on every cycle; it
+    # decides itself when that means a call (see BaseInverter.set_charge_limit).
+    if inverter_fronius_en:
+        charge_limit_w = charge_limit_for_mode(
+            current_overall_state,
+            round(battery_interface.get_max_charge_power()),
+            tgt_dc_charge_power,
+        )
+        if charge_limit_w is not None:
+            inverter_interface.set_charge_limit(charge_limit_w)
     if state_changed:
         logger.debug("[Main] Overall state changed recently")
         if inverter_fronius_en and mode_uses_dc_charge_limit(current_overall_state):

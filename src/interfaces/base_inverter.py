@@ -153,6 +153,19 @@ class BaseInverter(ABC):
         self.max_pv_charge_rate = rate_w
         return True
 
+    def set_charge_limit(self, power_w):
+        """Hand the battery's current charge limit to the inverter, if it takes one.
+
+        Called on every control cycle with the limit EOS Connect works to: the
+        charging curve and battery temperature, and in the modes without grid
+        charging also the PV charge rate. The default does nothing and returns
+        None - most inverters get what they need through their mode commands.
+        An inverter that can take the limit returns True or False for whether it
+        is in place.
+        """
+        del power_w  # not used by inverters without a separate charge limit
+        return None
+
     def disconnect(self):
         """Session schließt sich selbst."""
         logger.info(f"[{self.inverter_type}] Session closed")

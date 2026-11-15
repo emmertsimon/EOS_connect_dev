@@ -764,7 +764,13 @@ mosquitto_pub -h broker -t eos_connect/control/overall_state/set -m "-2"</code><
                         <code>homeassistant</code> and give it the three scripts or switches it should call:
                         <code>inverter.charge_from_grid</code>, <code>inverter.avoid_discharge</code> and
                         <code>inverter.discharge_allowed</code>. That covers inverters EOS Connect has no
-                        native driver for, as long as HA can already control them.</p>
+                        native driver for, as long as HA can already control them. Optionally,
+                        <code>inverter.charge_limit</code> takes the service calls that set the battery's
+                        maximum charge power (<code>{{ power }}</code> in W): EOS Connect then hands over
+                        the limit it works to &mdash; the charging curve and battery temperature, outside
+                        grid charging capped at <code>inverter.max_pv_charge_rate</code> &mdash; whenever it
+                        changes and every 10 minutes, so a script that only writes on a real change is
+                        enough on the HA side.</p>
                     <p><strong>As a dashboard</strong>, MQTT auto-discovery gives you the full entity set
                         described above with no configuration.</p>
 

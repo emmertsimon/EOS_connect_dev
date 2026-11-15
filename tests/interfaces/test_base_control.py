@@ -17,6 +17,7 @@ from unittest.mock import patch
 from src.interfaces.base_control import (
     BaseControl,
     calculate_tgt_dc_charge_power,
+    charge_limit_for_mode,
     mode_uses_dc_charge_limit,
 )
 
@@ -311,6 +312,22 @@ class TestDCChargeTargetCalculation:
     def test_mode_dependency_for_dc_charge_limit_command(self, overall_state, expected):
         """Only discharge/avoid-discharge states should update DC charge max."""
         assert mode_uses_dc_charge_limit(overall_state) is expected
+
+
+class TestChargeLimitForMode:
+    """What an inverter with a separate charge limit is told, per mode."""
+
+    @pytest.mark.parametrize("overall_state", [1, 2, 3, 4, 5])
+    def test_modes_with_a_dc_limit_get_that_limit(self, overall_state):
+        assert charge_limit_for_mode(overall_state, 6000, 3200) == 3200
+
+    @pytest.mark.parametrize("overall_state", [0, 6])
+    def test_grid_charging_gets_the_battery_maximum(self, overall_state):
+        """The grid power is set by the mode command; the limit must not cut it."""
+        assert charge_limit_for_mode(overall_state, 5700, 0) == 5700
+
+    def test_nothing_before_the_first_state(self):
+        assert charge_limit_for_mode(-1, 6000, 6000) is None
 
 
 class TestEffectiveDischargeAllowed:
