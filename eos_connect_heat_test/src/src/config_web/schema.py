@@ -2946,6 +2946,43 @@ _ALL_FIELDS: list[FieldDef] = [
         display_group="Physical",
     ),
     FieldDef(
+        key="managed_loads.min_power_w",
+        field_type="float",
+        default=0,
+        section="managed_loads",
+        level="expert",
+        description=(
+            "For a modulating appliance such as an inverter heat pump: the least it "
+            "draws while running, in watts. Rated power is then the most it draws, and "
+            "the built-in optimizer picks a power in between for every slot it runs - "
+            "published as Planned Power, for an automation to turn into a setpoint. "
+            "0 = it runs at rated power only"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-modulation",
+        validation={"min": 0, "max": 100000},
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Physical",
+    ),
+    FieldDef(
+        key="managed_loads.modulation_cop",
+        field_type="str",
+        default="",
+        section="managed_loads",
+        level="expert",
+        description=(
+            "How the efficiency changes with the power drawn, as 'W:factor' points on "
+            "the COP the model works out from the air temperature - e.g. "
+            "'400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74'. Linear in between, "
+            "flat outside. Only used with a minimum power. Empty = the same COP at "
+            "every power"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-modulation",
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Physical",
+    ),
+    FieldDef(
         key="managed_loads.standby_threshold_w",
         field_type="float",
         default=0,

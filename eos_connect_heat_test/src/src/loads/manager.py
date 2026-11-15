@@ -32,6 +32,7 @@ from .contribution import (
 )
 from .injection import InjectionError, parse_push, profile_from_entries
 from .instance import ManagedLoad
+from .modulation import heat_lines
 from .models.base import DemandContext
 from .presets import (
     EXTERNAL_TYPES, fallback_ambient_c, pulls_its_profile, uses_outdoor_ambient,
@@ -588,6 +589,15 @@ class ManagedLoadManager:
                 "id": item.id,
                 "demand_wh": round(float(demand.total_wh), 1),
                 "max_power_w": float(demand.max_power_w),
+                # A modulating appliance: the least it draws while running, and the
+                # heat per Wh across its range as solver lines (loads.modulation).
+                "min_power_w": float(demand.min_power_w or 0.0),
+                "heat_lines": [
+                    [round(slope, 6), round(intercept, 3)]
+                    for slope, intercept in heat_lines(
+                        demand.modulation, demand.min_power_w, demand.max_power_w
+                    )
+                ],
                 "value_eur_per_wh": self._value_of(item),
                 "feasible": _padded(demand.feasible, slots),
                 # Per slot, what a Wh is worth against the best slot; the demand above
@@ -822,6 +832,23 @@ class ManagedLoadManager:
                 if item.type in EXTERNAL_TYPES else SOURCE_INTERNAL,
             )
         )
+
+    def planned_power_now_w(self, item):
+        """
+        The power the last plan gives *item* in the slot that is running, in W.
+
+        For a modulating appliance this is the setpoint the plan wants - something a
+        release flag alone cannot carry. None before the first plan.
+        """
+        ctx = self._last_ctx_for.get(item.id)
+        plan = item.last_plan or []
+        if ctx is None or not plan:
+            return None
+        index = ctx.current_slot
+        if not 0 <= index < len(plan):
+            return 0.0
+        hours = ctx.hours_per_slot() or 1.0
+        return round(float(plan[index]) / hours, 1)
 
     def _record_decision(self, item, ctx, release, origin):
         """

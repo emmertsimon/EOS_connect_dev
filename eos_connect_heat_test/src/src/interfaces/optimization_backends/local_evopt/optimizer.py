@@ -422,6 +422,12 @@ class ManagedLoadConfig:
     # demand, its value and the efficiency are then unused: the store's band and what
     # heat is worth at the end of the horizon take their place.
     store: Optional[ThermalStoreConfig] = None
+    # A modulating appliance (EOS_connect extension): while running it draws anything
+    # from min_power_w to max_power_w; 0 means exactly max_power_w. heat_lines, for a
+    # store, is the heat per Wh across that range as ``[(slope, intercept_w), ...]``
+    # on top of the store's per-slot COP - see loads.modulation.heat_lines.
+    min_power_w: float = 0.0
+    heat_lines: Optional[List[Tuple[float, float]]] = None
 
     def efficiency_at(self, t):
         """The efficiency of slot *t*, 1.0 where none was given."""
@@ -762,7 +768,7 @@ class Optimizer:
             # run to enforce, or starts being priced. Without either, the appliance may
             # be placed in any slot and the switch carries nothing the continuous
             # variable does not already have.
-            if load.min_runtime_slots > 1 or load.start_cost_eur > 0:
+            if load.min_runtime_slots > 1 or load.start_cost_eur > 0 or load.min_power_w > 0:
                 self.variables['ml_on'][i] = [
                     self._new_var(f"ml_on_{i}_{t}", cat='Binary')
                     for t in self.time_steps
@@ -1381,7 +1387,15 @@ class Optimizer:
                 # on/off at its rated power, which is what a compressor does. The demand
                 # ceiling may then be met a slot short rather than exactly; that is the
                 # honest answer for something that cannot half-run.
-                self.problem += run[t] == cap * on[t]
+                if 0 < load.min_power_w < load.max_power_w:
+                    # A modulating appliance: running means at least its minimum, and
+                    # the plan picks the power above it. The lower bound keeps the
+                    # switch honest the same way the equality does for a fixed draw.
+                    floor = load.min_power_w * self.time_series.dt[t] / 3600.0
+                    self.problem += run[t] >= floor * on[t]
+                    self.problem += run[t] <= cap * on[t]
+                else:
+                    self.problem += run[t] == cap * on[t]
 
             self._add_commitment_constraints(load, on, feasible)
             self._add_switching_constraints(
@@ -1440,6 +1454,7 @@ class Optimizer:
         lows = self.variables['tm_lo'][i]
         highs = self.variables['tm_hi'][i]
         run = self.variables['ml'][i]
+        heat_in = self._modulated_heat(i, load) or run
         for t in self.time_steps:
             hours = self.time_series.dt[t] / 3600.0
             previous = store.t_initial if t == 0 else temps[t - 1]
@@ -1447,7 +1462,7 @@ class Optimizer:
             self.problem += (
                 capacity * temps[t]
                 == (capacity - loss) * previous
-                + store.at("cop", t, 1.0) * run[t]
+                + store.at("cop", t, 1.0) * heat_in[t]
                 + store.at("gain_wh", t)
                 + loss * store.at("ambient_c", t)
             )
@@ -1455,6 +1470,34 @@ class Optimizer:
             self.problem += temps[t] - highs[t] <= store.t_max
         # What is credited at the end: the final temperature, but no more than target.
         self.problem += self.variables['tm_end'][i] <= temps[-1]
+
+    def _modulated_heat(self, i, load):
+        """
+        Per slot, the drawn energy as the store feels it, for a modulating appliance.
+
+        The heat a Wh buys falls as the appliance runs harder. ``heat[t]`` stands for
+        it in the units of the store's per-slot COP and is held under each of the
+        appliance's heat lines - ``slope * E + intercept * hours * on`` - so it follows
+        the concave curve the user described. A slot that is off gets nothing: its
+        energy and switch are zero. None when the load has no lines; the drawn energy
+        then counts in full.
+
+        It is a ceiling, so a plan could take less heat than it pays for; it never has
+        a reason to, except to stay under the band's ceiling during a forced minimum
+        run - and then the real house would only be a little warmer than planned.
+        """
+        lines = load.heat_lines
+        on = self.variables['ml_on'].get(i)
+        if not lines or on is None:
+            return None
+        run = self.variables['ml'][i]
+        heat = [self._new_var(f"ml_heat_{i}_{t}", lowBound=0) for t in self.time_steps]
+        for t in self.time_steps:
+            hours = self.time_series.dt[t] / 3600.0
+            for slope, intercept_w in lines:
+                self.problem += heat[t] <= slope * run[t] + intercept_w * hours * on[t]
+        self.variables.setdefault('ml_heat', {})[i] = heat
+        return heat
 
     def _delivered(self, i, load):
         """A load's placed energy in units of its best slot."""

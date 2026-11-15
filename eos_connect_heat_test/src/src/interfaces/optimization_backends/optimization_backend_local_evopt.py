@@ -657,6 +657,13 @@ class LocalEVOptBackend(EVOptBackend):
                 continue
 
             mask = entry.get("feasible")
+            min_power = float(entry.get("min_power_w", 0) or 0)
+            if not 0 < min_power < power:
+                min_power = 0.0
+            lines = [
+                (float(slope), float(intercept))
+                for slope, intercept in (entry.get("heat_lines") or [])
+            ] if min_power and store else None
             configs.append(ManagedLoadConfig(
                 id=str(entry.get("id", "")),
                 demand_wh=demand,
@@ -676,6 +683,8 @@ class LocalEVOptBackend(EVOptBackend):
                 efficiency=self._solver_efficiency(entry.get("efficiency")),
                 exclusive_group=str(entry.get("exclusive_group", "") or "").strip(),
                 store=store,
+                min_power_w=min_power,
+                heat_lines=lines or None,
             ))
         if configs:
             logger.debug(
