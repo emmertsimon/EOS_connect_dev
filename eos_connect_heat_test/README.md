@@ -1,8 +1,9 @@
 # EOS connect develop + Heizung (PR 368)
 
-Test-Add-on: aktueller `ohAnd/EOS_connect` develop (0.3.42.396) mit PR #368
-(`feature/space-heating-managed-loads`, inkl. ohAnds Commits vom 14.11.) obendrauf.
-Quellstand: Branch `test/develop-plus-heating` in diesem Repo.
+Test-Add-on: aktueller `ohAnd/EOS_connect` develop (0.3.42.398) mit PR #368
+(`feature/space-heating-managed-loads`, inkl. ohAnds Commits vom 14.11.) und dem
+Ladekurven-PR (`feature/charging-curve-points`) obendrauf.
+Quellstand: Branch `test/develop-heating-curve` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).
 - Eigene Datenbank, eigener Slug: das develop-Add-on bleibt unangetastet.
