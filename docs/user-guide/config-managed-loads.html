@@ -798,6 +798,26 @@
                         not a daily energy balance, and a fortnight has too few days with both
                         heating and no sun to separate them.</p>
 
+                    <h3 id="managed-loads-cop-air">A tank indoors, a heat pump outdoors</h3>
+                    <p>A hot water tank loses its heat to the room it stands in, but an
+                        air-source heat pump takes the heat it puts in from the outdoor air. One
+                        ambient temperature cannot be both: at the room's 18&nbsp;&deg;C the COP is
+                        the same in every slot, and the plan sees no reason to make hot water at a
+                        mild midday rather than on a frosty morning. Set to the outdoor air instead,
+                        the losses come out half again too high in winter.</p>
+                    <p><code>cop_air_sensor</code> separates the two. Point it at the heat pump's
+                        outdoor sensor (EMS-ESP, Modbus) or any outdoor thermometer: the COP then
+                        follows the outdoor forecast, matched to that sensor hour by hour in the same
+                        way as an outdoor load's <a href="#managed-loads-ambient">ambient</a>, while
+                        the losses keep using the tank's surroundings. A heat meter
+                        (<code>heat_sensor</code>) is then fitted against the outdoor air too, so the
+                        slope can be measured. An air limit (<code>min_ambient_temp_c</code>) applies to
+                        the heat pump's air as well. Leave it empty where the store and the heat pump
+                        share the air &mdash; a pool, or a house heated by its own heat pump.</p>
+                    <p data-level="expert">Measured on a 360-litre tank behind a floor-heating heat pump: the hot water COP read
+                        2.7 in November and 3.9 in July, about 0.06 per kelvin &mdash; the same share
+                        per kelvin as the space heating from the same unit.</p>
+
                     <h3 id="managed-loads-cover">The cover</h3>
                     <p>A pool cover is worth roughly two thirds of the heat loss, and it goes on
                         and off on a daily rhythm. Reading the switch once and assuming that state

@@ -116,7 +116,8 @@ class ThermalStorageModel(BaseDemandModel):
 
     kind = KIND_CONTINGENT
     sensor_keys = ("temp_sensor", "target_temp_sensor", "power_sensor",
-                   "ambient_temp_sensor", "cover_sensor", "heat_sensor")
+                   "ambient_temp_sensor", "cover_sensor", "heat_sensor",
+                   "cop_air_sensor")
 
     def __init__(self, entry_id, config, calibration=None):
         super().__init__(entry_id, config)
@@ -290,7 +291,9 @@ class ThermalStorageModel(BaseDemandModel):
             elif not _in_season((day.month, day.day), self.season_start, self.season_end):
                 reason = REASON_SLOT_SEASON
             elif self.min_ambient_temp_c is not None:
-                ambient = self._ambient_at(ctx, index)
+                # The limit is about the air the appliance works in: for a heat pump
+                # with its own outdoor air that is the air, not the tank's room.
+                ambient = self._cop_air_at(ctx, index)
                 if ambient is not None and ambient < float(self.min_ambient_temp_c):
                     reason = REASON_SLOT_AMBIENT
 
@@ -305,6 +308,19 @@ class ThermalStorageModel(BaseDemandModel):
         if index < len(ctx.ambient_temp_c):
             return ctx.ambient_temp_c[index]
         return ctx.ambient_temp_c[-1]
+
+    @classmethod
+    def _cop_air_at(cls, ctx, index):
+        """
+        The air the COP is worked out from: the heat pump's own, where one is
+        configured (``cop_air_sensor``), otherwise the store's surroundings.
+        """
+        series = getattr(ctx, "cop_air_temp_c", None)
+        if not series:
+            return cls._ambient_at(ctx, index)
+        if index < len(series):
+            return series[index]
+        return series[-1]
 
     # -- demand ---------------------------------------------------------------------------
 
@@ -419,6 +435,14 @@ class ThermalStorageModel(BaseDemandModel):
                              or ctx.ambient_forecast_c is None)
                     else self._ambient_at(ctx, ctx.current_slot) - ctx.ambient_forecast_c
                 ),
+                # The heat pump's own air, where it differs from the surroundings.
+                "cop_air_now_c": (
+                    _round_or_none(self._cop_air_at(ctx, ctx.current_slot))
+                    if getattr(ctx, "cop_air_temp_c", None) else None
+                ),
+                "cop_air_measured_c": _round_or_none(
+                    getattr(ctx, "cop_air_measured_c", None)
+                ),
                 "horizon_hours": round(
                     max(0, ctx.slot_count - ctx.current_slot) * ctx.hours_per_slot(), 1
                 ),
@@ -466,10 +490,10 @@ class ThermalStorageModel(BaseDemandModel):
         """The COP the appliance would run at in every slot, from its air temperature."""
         series = []
         for index in range(ctx.slot_count):
-            ambient = self._ambient_at(ctx, index)
+            air = self._cop_air_at(ctx, index)
             series.append(
-                cop_at(ambient, self.calibrator.cop_nominal, self.calibrator.air_coefficient)
-                if ambient is not None else self.calibrator.cop_nominal
+                cop_at(air, self.calibrator.cop_nominal, self.calibrator.air_coefficient)
+                if air is not None else self.calibrator.cop_nominal
             )
         return series
 
@@ -546,7 +570,7 @@ class ThermalStorageModel(BaseDemandModel):
                 losses -= gain * max(0.0, float(solar[index]))
             if feasible[index]:
                 cops.append(
-                    cop_at(ambient, self.calibrator.cop_nominal,
+                    cop_at(self._cop_air_at(ctx, index), self.calibrator.cop_nominal,
                            self.calibrator.air_coefficient)
                 )
 
@@ -594,7 +618,8 @@ class ThermalStorageModel(BaseDemandModel):
 
             electrical_wh = float(plan[index]) if index < len(plan) else 0.0
             gained = electrical_wh * cop_at(
-                ambient, self.calibrator.cop_nominal, self.calibrator.air_coefficient
+                self._cop_air_at(ctx, index), self.calibrator.cop_nominal,
+                self.calibrator.air_coefficient,
             )
             gained -= loss_power_w(
                 self.calibrator.loss_coefficient, self.surface_m2, temperature, ambient,
