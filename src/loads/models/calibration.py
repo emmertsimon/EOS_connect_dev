@@ -279,6 +279,11 @@ class ThermalCalibrator:
         self.min_window_change_k = max(0.0, float(min_window_change_k or 0.0))
         # Where the current COP came from: "configured", "fit" or "heat_meter".
         self.cop_source = "configured"
+        # For a modulating heat pump: the COP factor at a given electrical power (see
+        # loads.modulation), or None. The planner multiplies the COP by it per slot, so
+        # a heat-meter reading taken at part load is divided by it first - otherwise a
+        # cold week of full-power runs would lower the level and the factor again.
+        self.cop_factor = None
 
         # Below this the appliance is standing by, not running. The module default is the
         # coarse 50 W guess every install made do with; a load whose metered circuit never
@@ -735,7 +740,9 @@ class ThermalCalibrator:
         the slope needed the first cold spell.
         """
         pairs = [
-            (row["ambient_c"], row["heat_w"] / row["power_w"], row["power_w"] * weight)
+            (row["ambient_c"],
+             row["heat_w"] / row["power_w"] / self._factor_at(row["power_w"]),
+             row["power_w"] * weight)
             for row, weight in zip(rows, weights)
             if row.get("heat_w") and row["power_w"] >= IDLE_POWER_W
         ]
@@ -756,6 +763,16 @@ class ThermalCalibrator:
             ridge = RIDGE_SAMPLES * (s_tt / len(pairs))
             slope = (s_tc + ridge * prior[1]) / (s_tt + ridge) if s_tt > 0 else prior[1]
         return mean_cop - slope * mean_t, slope
+
+    def _factor_at(self, power_w):
+        """The modulation factor at *power_w*, 1.0 without a curve or on a bad value."""
+        if self.cop_factor is None:
+            return 1.0
+        try:
+            factor = float(self.cop_factor(power_w))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 1.0
+        return factor if math.isfinite(factor) and factor > 0 else 1.0
 
     def _prior(self):
         """The configured values, as (a, b, k_open, k_covered)."""

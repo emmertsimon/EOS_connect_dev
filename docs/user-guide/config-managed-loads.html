@@ -582,6 +582,11 @@
                         electrical power over a few runs at different powers. Without it every watt counts
                         the same, and the plan will happily put a whole night's heat into the cheapest hour
                         at full power.</p>
+                    <p>With a <a href="#managed-loads-cop"><code>heat_sensor</code></a> as well, every
+                        reading is divided by the factor at the power it was taken at before it enters the
+                        COP fit. The level the model learns is then the COP at factor 1.0, and a cold week
+                        of full-power runs does not lower it on top of the curve that already accounts
+                        for them.</p>
                     <p>The plan's power for the slot that is running is published as
                         <strong>Planned Power</strong> (<code>managed_load/&lt;id&gt;/planned_power_w</code>).
                         A heat pump rarely takes a power setpoint directly; an automation turns it into

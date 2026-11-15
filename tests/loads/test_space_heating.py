@@ -190,13 +190,15 @@ def _heating(moment, temp, running):
     return temp < 21.2 if running else temp < 20.7
 
 
-def _simulate(days, step_minutes=5, heat_meter=False):
+def _simulate(days, step_minutes=5, heat_meter=False, run_power_w=RUN_POWER_W,
+              factor=1.0):
+    """*factor* scales the COP while running, as a modulating heat pump's curve does."""
     samples = []
     step_h = step_minutes / 60.0
     moment, temp, heat_kwh, running = T0, 21.0, 0.0, False
     for _ in range(int(days * 24 / step_h)):
         running = _heating(moment, temp, running)
-        power = RUN_POWER_W if running else 10.0
+        power = run_power_w if running else 10.0
         ambient = _ambient(moment)
         samples.append(
             {
@@ -209,7 +211,7 @@ def _simulate(days, step_minutes=5, heat_meter=False):
             }
         )
         thermal = (
-            power * cop_at(ambient, TRUE_COP_NOMINAL, TRUE_AIR_COEFF)
+            power * factor * cop_at(ambient, TRUE_COP_NOMINAL, TRUE_AIR_COEFF)
             if running
             else 0.0
         )
@@ -280,6 +282,55 @@ def test_a_heat_meter_also_measures_where_the_cop_may_be_fitted():
     calibrator = _house_calibrator(cop_nominal=4.0, air=0.03, learn_cop=True)
     calibrator.observe_series(_simulate(days=5, heat_meter=True))
     assert calibrator.cop_source == "heat_meter"
+
+
+def test_a_heat_meter_reading_at_part_load_is_divided_by_the_modulation_factor():
+    """Full-power runs read low; the level learned is the COP at factor 1.0."""
+    samples = _simulate(days=5, heat_meter=True, run_power_w=1700.0, factor=0.76)
+    truth = cop_at(6.0, TRUE_COP_NOMINAL, TRUE_AIR_COEFF)
+
+    plain = _house_calibrator(cop_nominal=4.0, air=0.03)
+    plain.observe_series(samples)
+    assert cop_at(6.0, plain.cop_nominal, plain.air_coefficient) == (
+        pytest.approx(0.76 * truth, rel=0.05)
+    )
+
+    scaled = _house_calibrator(cop_nominal=4.0, air=0.03)
+    scaled.cop_factor = lambda power_w: 0.76 if power_w > 1000 else 1.0
+    scaled.observe_series(samples)
+    assert scaled.cop_source == "heat_meter"
+    assert cop_at(6.0, scaled.cop_nominal, scaled.air_coefficient) == (
+        pytest.approx(truth, rel=0.05)
+    )
+
+
+def test_a_broken_modulation_factor_counts_as_none():
+    calibrator = _house_calibrator()
+    calibrator.cop_factor = lambda power_w: 0.0
+    assert calibrator._factor_at(900.0) == 1.0  # pylint: disable=protected-access
+    calibrator.cop_factor = lambda power_w: float("nan")
+    assert calibrator._factor_at(900.0) == 1.0  # pylint: disable=protected-access
+
+
+def test_the_house_hands_its_modulation_curve_to_the_calibrator():
+    curve = "400:1.0, 800:1.0, 1500:0.83, 1700:0.76"
+    model = build_model(
+        {**MEASURED_HOUSE, "rated_power_w": 2800, "min_power_w": 300,
+         "modulation_cop": curve}
+    )
+    assert model.calibrator.cop_factor(600.0) == pytest.approx(1.0)
+    assert model.calibrator.cop_factor(1700.0) == pytest.approx(0.76)
+    model.reset_calibration()
+    assert model.calibrator.cop_factor(1700.0) == pytest.approx(0.76)
+
+
+def test_without_a_minimum_power_the_curve_is_not_applied_to_the_meter():
+    """The planner ignores the curve then, so the calibrator must too."""
+    model = build_model(
+        {**MEASURED_HOUSE, "rated_power_w": 2800,
+         "modulation_cop": "400:1.0, 1700:0.76"}
+    )
+    assert model.calibrator.cop_factor is None
 
 
 def test_a_heat_meter_that_never_moves_is_ignored():
