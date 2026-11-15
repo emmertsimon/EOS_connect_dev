@@ -336,7 +336,7 @@ battery_interface = factory.create_battery_interface(
                     <h2 id="config-schema"><i class="fas fa-table-list" aria-hidden="true"></i> The config
                         schema</h2>
                     <p><strong><code>src/config_web/schema.py</code> is the single point of truth for every
-                            configuration field.</strong> It holds 200 <code>FieldDef</code> entries across 13
+                            configuration field.</strong> It holds 201 <code>FieldDef</code> entries across 13
                         sections. The web UI, the REST API, the migration logic and this documentation site all
                         read from it. There is no second place to register a setting.</p>
 
@@ -374,7 +374,7 @@ battery_interface = factory.create_battery_interface(
                                 <tr>
                                     <td><code>help_url</code></td>
                                     <td><code>config-battery.html#battery-price</code> &mdash; a page under
-                                        <code>user-guide/</code> and a fragment. All 200 fields have one.</td>
+                                        <code>user-guide/</code> and a fragment. All 201 fields have one.</td>
                                 </tr>
                                 <tr>
                                     <td><code>validation</code>, <code>depends_on</code></td>
@@ -415,7 +415,7 @@ battery_interface = factory.create_battery_interface(
                     </ol>
                     <div class="scroll-x">
                         <pre><code>python scripts/export_config_schema.py
-# Exported 200 fields and 7 managed-load presets to docs/assets/data/config_schema.json</code></pre>
+# Exported 201 fields and 7 managed-load presets to docs/assets/data/config_schema.json</code></pre>
                     </div>
                     <p>Nothing regenerates that JSON automatically, so the export is a manual step &mdash; but
                         it is a guarded one.

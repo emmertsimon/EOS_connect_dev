@@ -111,6 +111,9 @@ class OptimizationInterface:
                 plan_stability_scope=config.get(
                     "local_evopt_plan_stability_scope", "managed_loads"
                 ),
+                exact_charging_curve=bool(
+                    config.get("local_evopt_exact_charging_curve", False)
+                ),
             )
             self.backend_type = "local_evopt"
             logger.info(

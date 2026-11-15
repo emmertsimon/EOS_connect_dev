@@ -10,7 +10,15 @@ import pytest
 
 from src.interfaces.charging_curve import (
     ChargingCurveError,
+    concave_envelope,
+    concave_pieces,
     curve_power_at,
+    envelope_deviation,
+    envelope_exact_up_to,
+    envelope_segments,
+    full_range_points,
+    limited_pieces,
+    merge_shortfall,
     parse_curve_points,
     validate_curve_text,
 )
@@ -114,3 +122,106 @@ def test_the_curve_is_held_flat_outside_its_points():
 def test_a_single_point_is_a_constant_limit():
     assert curve_power_at([(70.0, 2500.0)], 10) == 2500.0
     assert curve_power_at([(70.0, 2500.0)], 99) == 2500.0
+
+
+# -- shape, for planning the curve inside the solver ------------------------------------
+
+
+def test_points_are_padded_flat_to_both_ends():
+    assert full_range_points([(20.0, 4000.0), (80.0, 2000.0)]) == [
+        (0.0, 4000.0), (20.0, 4000.0), (80.0, 2000.0), (100.0, 2000.0),
+    ]
+
+
+def test_a_concave_curve_is_its_own_envelope():
+    concave = [(0.0, 6000.0), (80.0, 6000.0), (90.0, 5000.0), (100.0, 1000.0)]
+    assert concave_envelope(concave) == concave
+    assert envelope_deviation(concave) == pytest.approx(0.0)
+
+
+def test_a_convex_stretch_is_bridged_and_reported():
+    # 90 -> 95 drops 3000 W, 95 -> 100 only 2200 W: the curve bends upward there.
+    assert concave_envelope(full_range_points(CURVE)) == [
+        (0.0, 6000.0), (90.0, 6000.0), (100.0, 800.0),
+    ]
+    # The hull passes 95 % at 3400 W instead of 3000 W.
+    assert envelope_deviation(CURVE) == pytest.approx(400.0)
+
+
+def test_every_segment_line_lies_on_or_above_the_envelope():
+    """The minimum over the lines is the envelope, and no line can go below it."""
+    points = [(10.0, 2000.0), (20.0, 6000.0), (90.0, 6000.0), (100.0, 1000.0)]
+    segments = envelope_segments(points)
+    hull = concave_envelope(full_range_points(points))
+    for soc in range(0, 101):
+        lines = [p0 + slope * (soc - s0) for s0, p0, slope in segments]
+        assert min(lines) == pytest.approx(curve_power_at(hull, soc))
+        assert min(lines) >= 0
+
+
+def test_a_flat_curve_is_one_flat_segment():
+    assert envelope_segments([(50.0, 3000.0)]) == [(0.0, 3000.0, 0.0)]
+
+
+HARD_KNEE = "0:6000, 90:6000, 91:3200, 93:1600, 95:1000, 97:700, 98:500"
+
+
+def test_a_concave_curve_is_one_piece_and_exact_everywhere():
+    concave = [(0.0, 6000.0), (80.0, 6000.0), (90.0, 5000.0), (100.0, 1000.0)]
+    assert len(concave_pieces(concave)) == 1
+    assert envelope_exact_up_to(concave) == 100.0
+
+
+def test_a_curve_is_cut_where_it_bends_upward():
+    pieces = concave_pieces(parse_curve_points(HARD_KNEE, MAX_W))
+    assert [(lo, hi) for lo, hi, _ in pieces] == [
+        (0.0, 91.0), (91.0, 93.0), (93.0, 95.0), (95.0, 98.0), (98.0, 100.0),
+    ]
+    # Each piece is the minimum of its own lines, which reproduces the curve.
+    points = parse_curve_points(HARD_KNEE, MAX_W)
+    for soc in (50, 90.5, 92, 94, 96, 97.5, 99):
+        lo, hi, lines = next(p for p in pieces if p[0] <= soc <= p[1])
+        assert min(p0 + k * (soc - s0) for s0, p0, k in lines) == pytest.approx(
+            curve_power_at(points, soc)
+        )
+
+
+def test_the_envelope_is_exact_up_to_the_first_upward_bend():
+    assert envelope_exact_up_to(parse_curve_points(HARD_KNEE, MAX_W)) == 90.0
+
+
+def test_merging_keeps_the_cuts_that_best_preserve_the_charging_time():
+    points = parse_curve_points(HARD_KNEE, MAX_W)
+    merged = limited_pieces(points, 3)
+    assert [(lo, hi) for lo, hi, _ in merged] == [(0.0, 91.0), (91.0, 98.0), (98.0, 100.0)]
+    # Unmerged pieces keep their exact lines ...
+    assert merged[0][2] == concave_pieces(points)[0][2]
+    # ... and a merged one runs under the curve: a plan may count on a little less
+    # than the battery takes, never on more - and never on less than nothing.
+    for tenth in range(900, 1001):
+        soc = tenth / 10
+        lo, hi, lines = next(p for p in merged if p[0] <= soc <= p[1])
+        planned = min(p0 + k * (soc - s0) for s0, p0, k in lines)
+        assert 0.0 <= planned <= curve_power_at(points, soc) + 1e-6, soc
+    assert limited_pieces(points, 9) == concave_pieces(points)
+
+
+def test_the_shortfall_of_a_merge_is_measured_where_it_is_worst():
+    points = parse_curve_points(HARD_KNEE, MAX_W)
+    assert merge_shortfall(points, limited_pieces(points, 9))[0] == pytest.approx(0.0, abs=1e-6)
+    worst_w, at_soc = merge_shortfall(points, limited_pieces(points, 3))
+    # five pieces merged into three: the line across 91-98 % sags under the knee
+    assert 1000.0 < worst_w < 2000.0
+    assert 91.0 <= at_soc <= 92.0
+
+
+def test_a_merged_piece_down_to_zero_at_full_still_allows_sitting_there():
+    """A curve ending at 0 W: the merged line may reach zero at 100 %, not go below."""
+    points = parse_curve_points("0:5000, 85:5000, 88:1500, 92:900, 96:600, 100:0", 5000)
+    merged = limited_pieces(points, 2)
+    lo, hi, lines = merged[-1]
+    assert hi == 100.0
+    for tenth in range(int(lo * 10), 1001):
+        soc = tenth / 10
+        planned = min(p0 + k * (soc - s0) for s0, p0, k in lines)
+        assert -1e-9 <= planned <= curve_power_at(points, soc) + 1e-6, soc

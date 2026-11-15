@@ -953,6 +953,28 @@ _ALL_FIELDS: list[FieldDef] = [
         hot_reload=True,
     ),
     FieldDef(
+        key="eos.local_evopt_exact_charging_curve",
+        field_type="bool",
+        default=False,
+        section="eos",
+        level="expert",
+        description=(
+            "Plan the charging curve inside the solver, at each slot's average state "
+            "of charge, instead of adjusting per-slot limits around it. Meant for "
+            "curves from points with a hard knee (e.g. full power to 90 %, then a "
+            "steep drop), which the default reads at the start of each slot and can "
+            "overrate by the whole drop. A curve that bends upward more than twice is "
+            "merged and then planned somewhat under it - the log says by how much. "
+            "The re-solves near full take at most four times the first solve (at "
+            "least 5 s) and, together with it, stay within the solver time limit; out "
+            "of time, the plain plan stands"
+        ),
+        labels=["restart_required"],
+        help_url="config-battery.html#charging-curve",
+        depends_on={"eos.source": "local_evopt"},
+        display_group="Local Optimizer",
+    ),
+    FieldDef(
         key="eos.local_evopt_terminal_soc_value",
         field_type="select",
         default="cheapest_ahead",

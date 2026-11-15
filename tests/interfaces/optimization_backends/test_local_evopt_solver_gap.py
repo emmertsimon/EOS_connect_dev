@@ -8,6 +8,10 @@ the slack the gap allows, far larger than anything the plan decides. With a hous
 the plan that slack exceeded the cost of an evening's household load, and a solve
 could stop at a plan that held a full battery through a dear evening and bought the
 house's power instead. Both terms are now measured from where they start.
+
+The charging-curve rounds of an exact plan are each a fresh branch and bound whose
+plan is kept as found, so they solve to a much tighter gap of their own: at the main
+solve's 1 % the loss could compound from round to round.
 """
 
 import pytest
@@ -20,6 +24,7 @@ from src.interfaces.optimization_backends.local_evopt.optimizer import (  # noqa
     ManagedLoadConfig,
     OptimizationStrategy,
     Optimizer,
+    OptimizerSettings,
     ThermalStoreConfig,
     TimeSeriesData,
 )
@@ -94,3 +99,31 @@ def test_a_dear_evening_is_served_from_the_battery_with_a_house_in_the_plan():
     # The 44 ct hours come first, 500 Wh of house load each: the battery covers them.
     assert sum(discharge[:8]) >= 3500.0
     assert sum(result["grid_import"][:8]) < 600.0
+
+
+def test_curve_rounds_solve_to_a_tight_gap_and_hand_the_solver_back(monkeypatch):
+    """The main solve keeps its 1 %; each charging-curve round solves near exactly, so
+    the rounds cannot compound the slack, and the solver's own gaps come back after."""
+    from tests.interfaces.optimization_backends.test_local_evopt_exact_curve import (  # pylint: disable=import-outside-toplevel
+        CONVEX,
+        _solve,
+    )
+
+    real = pulp.LpProblem.solve
+    seen = []
+    solvers = []
+
+    def record(self, solver=None, **kwargs):
+        seen.append((solver.optionsDict.get("gapRel"), solver.optionsDict.get("gapAbs")))
+        solvers.append(solver)
+        return real(self, solver, **kwargs)
+
+    monkeypatch.setattr(pulp.LpProblem, "solve", record)
+    _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=True)
+    assert len(seen) >= 2, "the curve should have needed a round"
+    assert seen[0] == (OptimizerSettings().gapRel, OptimizerSettings().gapAbs)
+    for gap_rel, gap_abs in seen[1:]:
+        assert gap_rel == Optimizer.CURVE_REFINE_GAP_REL <= 0.001
+        assert gap_abs == Optimizer.CURVE_REFINE_GAP_ABS
+    assert solvers[0].optionsDict.get("gapRel") == OptimizerSettings().gapRel
+    assert "gapAbs" not in solvers[0].optionsDict

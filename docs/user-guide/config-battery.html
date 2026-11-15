@@ -108,6 +108,32 @@
                         exactly what the battery takes. Like the built-in curve, the result is rounded to
                         50&nbsp;W, so a point below 25&nbsp;W means 0&nbsp;W &mdash; no charging there. A
                         value that does not parse is refused on save, with the offending point named.</p>
+                    <p><strong>Exact planning near full.</strong> By default the built-in optimizer reads
+                        the curve at the state of charge each slot starts at. For a gentle curve that is
+                        close enough; at a hard knee it is not: a quarter hour that starts at 89.9&nbsp;%
+                        is planned at full power and ends near 99&nbsp;%, while the battery drops to a
+                        fraction at 91&nbsp;%. <code>eos.local_evopt_exact_charging_curve</code> plans the
+                        curve inside the solver instead, at each slot's average state of charge, so no
+                        slot counts on more than the curve allows there. Only slots that reach the top
+                        get the extra decisions, managed loads stay where the first solve put them, and
+                        the extra solving takes at most four times the plain solve (at least
+                        5&nbsp;s) &mdash; never more than what the plain solve left of the solver time
+                        limit (<code>eos.local_evopt_time_limit</code>, capped by the optimization
+                        interval). Should it run out, the plain plan stands and the log says so.</p>
+                    <p>Two limits to know about. First, a curve that flattens again after the drop is
+                        cut into stretches the solver chooses between, and it takes at most three: a
+                        curve with more upward bends is merged, and a merged stretch is planned
+                        <em>under</em> the curve, never above it. The log names the largest gap when it
+                        starts. For <code>0:6000, 90:6000, 91:3200, 93:1600, 95:1000, 97:700,
+                        98:500</code>, five stretches become three and the plan stays up to about
+                        1.5&nbsp;kW under the curve just above 91&nbsp;%. The built-in formula bends
+                        gently all the way from 50&nbsp;% and is merged as well, up to about a fifth of
+                        the maximum charge power under it just above 50&nbsp;%; for it the default is
+                        usually the better choice. A fourth stretch roughly halves such gaps but made
+                        the solve markedly slower and less predictable, so three it is. Second, the
+                        average state of charge is the slot's own: with 15-minute slots that is a few
+                        percent, with 60-minute slots (<code>eos.time_frame</code> 3600) one slot can
+                        span the whole knee, and the curve is then held only on average across it.</p>
                 </div>
 
                 <div class="content-section" data-level="standard">
