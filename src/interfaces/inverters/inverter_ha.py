@@ -8,6 +8,9 @@ can be used as an EOS Connect inverter.
 
 import json
 import logging
+import threading
+import time
+
 import requests
 
 from ..base_inverter import BaseInverter  # pylint: disable=relative-beyond-top-level
@@ -16,7 +19,7 @@ logger = logging.getLogger("__main__").getChild("InverterHA")
 logger.setLevel(logging.INFO)
 
 
-class InverterHA(BaseInverter):
+class InverterHA(BaseInverter):  # pylint: disable=too-many-instance-attributes
     """
     Inverter implementation that controls batteries via Home Assistant service calls.
 
@@ -34,12 +37,25 @@ class InverterHA(BaseInverter):
         "charge_from_grid": [...],                  # Array of service call objects
         "avoid_discharge": [...],                   # Array of service call objects
         "discharge_allowed": [...],                 # Array of service call objects
+        "charge_limit": [...],                      # Optional: sets max charge power
         "max_grid_charge_rate": 5000,               # In Watts
         "max_pv_charge_rate": 5000,                 # In Watts
     }
     """
 
     supports_extended_monitoring_default = False
+
+    # The charge limit is sent again after this long even when it has not changed,
+    # so a value lost on the way (an inverter restart, HA busy restarting) comes
+    # back by itself, and HA can tell from the call that EOS still holds the limit.
+    CHARGE_LIMIT_REFRESH_S = 600
+    # After a failed call the same value is not tried again for this long.
+    CHARGE_LIMIT_RETRY_S = 60
+    # A new limit closer than this to the one HA already has waits for the refresh.
+    # The limit moves in small steps as the SOC climbs the curve; without a deadband
+    # every one of them was a service call (and, behind it, a register write).
+    # Going to or from 0 W - charging stops or resumes - is always sent at once.
+    CHARGE_LIMIT_DEADBAND_W = 100
 
     def __init__(self, config: dict):
         # HA uses url instead of address — always set address to url for HA inverters
@@ -89,6 +105,12 @@ class InverterHA(BaseInverter):
             "allow_discharge": self._parse_json_field(config.get("discharge_allowed", [])),
         }
         self.current_mode = None
+        # Optional: service calls that set the battery's maximum charge power.
+        self.charge_limit_sequence = self._parse_json_field(config.get("charge_limit", []))
+        self._charge_limit_lock = threading.Lock()
+        self._charge_limit_sent = None  # last value HA accepted, W
+        self._charge_limit_tried = None  # last value tried, W
+        self._charge_limit_tried_at = 0.0  # time.monotonic() of that try
 
         logger.info("[InverterHA] Initialized with URL: %s", self.url)
 
@@ -291,6 +313,61 @@ class InverterHA(BaseInverter):
         """
         if value:
             self._execute_sequence(self.mode_sequences["force_charge"])
+
+    def set_charge_limit(self, power_w):
+        """Run the ``charge_limit`` service calls with ``{{ power }}`` = *power_w*.
+
+        Called on every control cycle; HA only hears about it when the value
+        moves by ``CHARGE_LIMIT_DEADBAND_W`` or more (or to or from 0 W), every
+        ``CHARGE_LIMIT_REFRESH_S`` as a refresh with the current value, and -
+        after a failed call - again once ``CHARGE_LIMIT_RETRY_S`` has passed. A
+        call already under way is not queued behind: the next cycle catches up.
+
+        Returns None without a ``charge_limit`` sequence, otherwise whether the
+        limit is in place.
+        """
+        if not self.charge_limit_sequence:
+            return None
+        power_w = max(0, int(round(power_w)))
+        # Not a `with`: a busy lock means "skip this cycle", not "wait for it".
+        if not self._charge_limit_lock.acquire(blocking=False):  # pylint: disable=consider-using-with
+            return self._charge_limit_unchanged(self._charge_limit_sent, power_w)
+        try:
+            since = time.monotonic() - self._charge_limit_tried_at
+            if self._charge_limit_unchanged(self._charge_limit_sent, power_w):
+                if since < self.CHARGE_LIMIT_REFRESH_S:
+                    return True
+            elif (
+                self._charge_limit_sent is None
+                and self._charge_limit_unchanged(self._charge_limit_tried, power_w)
+                and since < self.CHARGE_LIMIT_RETRY_S
+            ):
+                return False
+            self._charge_limit_tried = power_w
+            self._charge_limit_tried_at = time.monotonic()
+            changed = power_w != self._charge_limit_sent
+            if self._execute_sequence(self.charge_limit_sequence, variables={"power": power_w}):
+                if changed:
+                    logger.info("[InverterHA] Charge limit set to %s W", power_w)
+                self._charge_limit_sent = power_w
+                return True
+            self._charge_limit_sent = None
+            logger.warning(
+                "[InverterHA] Charge limit %s W not set - trying again in %s s",
+                power_w,
+                self.CHARGE_LIMIT_RETRY_S,
+            )
+            return False
+        finally:
+            self._charge_limit_lock.release()
+
+    def _charge_limit_unchanged(self, known_w, power_w):
+        """Whether *power_w* is close enough to *known_w* not to need a call."""
+        if known_w is None:
+            return False
+        if power_w == 0 or known_w == 0:
+            return power_w == known_w  # stopping or resuming charging is never noise
+        return abs(power_w - known_w) < self.CHARGE_LIMIT_DEADBAND_W
 
     def get_battery_info(self) -> dict:
         """Return battery info. HA does not provide direct battery data."""

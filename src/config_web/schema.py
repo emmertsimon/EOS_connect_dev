@@ -2299,6 +2299,27 @@ _ALL_FIELDS: list[FieldDef] = [
         depends_on={"inverter.type": ["homeassistant"]},
         display_group="Home Assistant Service Calls",
     ),
+    FieldDef(
+        key="inverter.charge_limit",
+        field_type="json",
+        default=[],
+        section="inverter",
+        level="standard",
+        description=(
+            "Optional: array of Home Assistant service calls that set the battery's "
+            "maximum charge power, {{ power }} in W. EOS Connect runs them when its "
+            "limit moves by 100 W or more (or to or from 0 W) and again every 10 "
+            "minutes. The limit is the charging curve and the battery temperature; "
+            "outside grid charging it is also capped at Max PV charge rate "
+            "(inverter.max_pv_charge_rate, default 5000 W), so raise that to the "
+            "battery's maximum if it can charge faster. While charging from the grid "
+            "it is the battery's maximum. Leave empty if the inverter keeps its own limit"
+        ),
+        labels=["restart_required"],
+        help_url="config-battery.html#inverter",
+        depends_on={"inverter.type": ["homeassistant"]},
+        display_group="Home Assistant Service Calls",
+    ),
     # ===== EVCC =====
     FieldDef(
         key="evcc.url",
