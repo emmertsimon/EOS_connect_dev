@@ -7,6 +7,7 @@ battery that tapers at 90 % is not planned as if it filled at full power to 100 
 The checks read the solved numbers back rather than trusting the constraint.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -40,15 +41,16 @@ ETA = 0.95
 TAPER = [(0.0, 5000.0), (80.0, 5000.0), (100.0, 500.0)]  # concave
 
 
-def _limits(points, cap=CAP):
-    """The curve as the backend hands it to the solver (see `_charge_limits`)."""
+def _curve(points, cap=CAP, exact=False):
+    """The curve as the backend hands it to the solver (see `_charge_curve_config`)."""
     backend = LocalEVOptBackend.__new__(LocalEVOptBackend)
+    backend.exact_charging_curve = exact
     backend._charge_curve = sorted(points)
     backend._charge_curve_shape = None
-    return backend._charge_limits(cap)
+    return backend._charge_curve_config(cap)
 
 
-def _solve(points=None, s_initial=6000.0, pv_wh=2000.0, sun_slots=T):
+def _solve(points=None, s_initial=6000.0, pv_wh=2000.0, sun_slots=T, exact=False):
     """
     Sun for *sun_slots* slots and none after, nothing for exporting it: whatever the
     battery does not take while the sun shines is lost, so the solver charges as much
@@ -57,7 +59,7 @@ def _solve(points=None, s_initial=6000.0, pv_wh=2000.0, sun_slots=T):
     battery = BatteryConfig(
         s_min=500, s_max=CAP, s_initial=s_initial, c_max=C_MAX, d_max=C_MAX,
         p_a=0.0003, charge_from_grid=False, s_capacity=CAP,
-        charge_limits=_limits(points) if points else None,
+        charge_curve=_curve(points, exact=exact) if points else None,
     )
     series = TimeSeriesData(
         dt=[DT] * T, gt=[100.0] * T,
@@ -110,21 +112,43 @@ def test_below_the_knee_the_curve_changes_nothing():
     assert soc_curve[-1] == pytest.approx(soc_free[-1], abs=1e-3)
 
 
-def test_a_convex_stretch_is_held_to_its_envelope():
+CONVEX = [(0.0, 5000.0), (90.0, 5000.0), (95.0, 2000.0), (100.0, 1500.0)]
+
+
+def test_by_default_a_convex_stretch_is_held_to_its_envelope():
     """Documented behaviour: a curve that bends upward is planned along its hull."""
-    convex = [(0.0, 5000.0), (90.0, 5000.0), (95.0, 2000.0), (100.0, 1500.0)]
-    hull = concave_envelope(full_range_points(convex))
-    charge, soc = _solve(convex, s_initial=8800.0)
+    hull = concave_envelope(full_range_points(CONVEX))
+    charge, soc = _solve(CONVEX, s_initial=8800.0)
     for t, energy in enumerate(charge):
         allowed_wh = curve_power_at(hull, _avg_soc_percent(8800.0, soc, t)) * DT / 3600
         assert energy <= allowed_wh + 1e-3
 
 
+@pytest.mark.parametrize("s_initial", [8800.0, 9300.0])
+def test_exact_planning_holds_a_convex_curve_itself(s_initial):
+    charge, soc = _solve(CONVEX, s_initial=s_initial, sun_slots=6, exact=True)
+    for t, energy in enumerate(charge):
+        allowed_wh = curve_power_at(CONVEX, _avg_soc_percent(s_initial, soc, t)) * DT / 3600
+        assert energy <= allowed_wh + 1e-3, f"slot {t}: {energy:.1f} Wh > {allowed_wh:.1f} Wh"
+
+
+def test_exact_planning_charges_less_than_the_envelope_promises():
+    envelope_charge, envelope_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2)
+    exact_charge, exact_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=True)
+    assert exact_soc[0] < envelope_soc[0] - 50
+
+
 def test_lines_that_can_never_bind_are_left_out():
-    optimizer_lines = _limits([(0.0, 9000.0), (100.0, 6000.0)])  # always above c_max
-    battery = BatteryConfig(s_capacity=CAP, s_max=CAP, c_max=C_MAX, charge_limits=optimizer_lines)
+    curve = _curve([(0.0, 9000.0), (100.0, 6000.0)])  # always above c_max
+    battery = BatteryConfig(s_capacity=CAP, s_max=CAP, c_max=C_MAX, charge_curve=curve)
+    assert Optimizer._binding_lines(curve.envelope, 0.0, CAP, C_MAX) == []
     optimizer = MagicMock()
     optimizer.problem = MagicMock()
+    optimizer.variables = {"s": {0: [MagicMock()] * T}, "c": {0: [MagicMock()] * T}}
+    optimizer.time_steps = range(T)
+    optimizer.time_series = SimpleNamespace(dt=[DT] * T)
+    optimizer._curve_exact_slots = {}
+    optimizer._binding_lines = Optimizer._binding_lines
     Optimizer._add_charge_curve_constraints(optimizer, 0, battery)
     optimizer.problem.__iadd__.assert_not_called()
 
@@ -150,7 +174,7 @@ def _eos_request(initial_soc_pct=85, n_slots=192):
     }
 
 
-def test_the_backend_hands_the_curve_to_the_solver_as_lines_in_wh():
+def test_the_backend_hands_the_curve_to_the_solver_in_wh():
     backend = LocalEVOptBackend(time_frame_base=900, time_zone=ZoneInfo("Europe/Berlin"))
     built = []
     original = LocalEVOptBackend._build_optimizer
@@ -164,19 +188,29 @@ def test_the_backend_hands_the_curve_to_the_solver_as_lines_in_wh():
         response, _ = backend.optimize(_eos_request(), battery_charge_curve=TAPER)
 
     assert "error" not in response
-    limits = built[0].batteries[0].charge_limits
+    curve = built[0].batteries[0].charge_curve
     # Flat 5000 W from 0 % (anchored at 0 Wh), then -225 W per % from 80 % = -2.25 W/Wh.
-    assert limits == [
-        (0.0, 5000.0, 0.0),
-        (pytest.approx(8000.0), 5000.0, pytest.approx(-2.25)),
+    lines = [(0.0, 5000.0, 0.0), (pytest.approx(8000.0), 5000.0, pytest.approx(-2.25))]
+    assert curve.envelope == lines
+    assert curve.pieces == [(0.0, pytest.approx(10000.0), lines)]
+    assert curve.envelope_exact_below == pytest.approx(10000.0)
+
+
+def test_exact_mode_cuts_a_convex_curve_into_pieces():
+    curve = _curve(CONVEX, exact=True)
+    assert [(lo, hi) for lo, hi, _ in curve.pieces] == [
+        (0.0, pytest.approx(9500.0)), (pytest.approx(9500.0), pytest.approx(10000.0)),
     ]
+    assert curve.envelope_exact_below == pytest.approx(9000.0)
+    # Without it the solver gets the envelope as its only piece.
+    assert len(_curve(CONVEX).pieces) == 1
 
 
 def test_the_backend_plans_without_lines_when_no_curve_is_given():
     backend = LocalEVOptBackend(time_frame_base=900, time_zone=ZoneInfo("Europe/Berlin"))
     backend._set_charge_curve(TAPER)
     backend._set_charge_curve(None)  # the next run without a curve forgets the last one
-    assert backend._charge_limits(10000.0) is None
+    assert backend._charge_curve_config(10000.0) is None
 
 
 def test_the_local_backend_claims_the_capability_and_the_external_ones_do_not():

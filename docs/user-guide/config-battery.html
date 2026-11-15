@@ -86,13 +86,17 @@
                         is held flat, so you only need the points where something changes. Write a decimal
                         comma? Then separate the points with semicolons or line breaks.</p>
                     <p>The battery temperature derating applies on top, to the live limit and to the
-                        plan alike. The plan reads the curve at each slot's average state of charge. It
-                        can only follow a curve exactly where the power falls off ever more steeply
-                        towards full (a concave curve); a stretch that drops hard and then levels off is
-                        planned slightly generously, and the log says by how much. Adding a point in the
-                        middle of such a stretch takes most of that away. The external EVopt service and
-                        the EOS server take one fixed maximum: with those only the live limit follows the
-                        curve.</p>
+                        plan alike. The plan reads the curve at each slot's average state of charge. A
+                        curve whose power falls off ever more steeply towards full (a concave curve) is
+                        planned exactly and costs nothing. A curve that drops hard and then levels off
+                        into a long tail bends upward; by default the plan follows its envelope there,
+                        which keeps the solve as fast as without a curve but lets the plan expect the
+                        last few percent sooner than they arrive &mdash; the log says by how much.
+                        <code>eos.local_evopt_exact_charging_curve</code> plans such a curve exactly
+                        instead (up to three stretches; more are merged where it matters least), at the
+                        price of solves that take seconds rather than a fraction of one. The live limit
+                        always follows the points exactly. The external EVopt service and the EOS server
+                        take one fixed maximum: with those only the live limit follows the curve.</p>
                     <div data-schema-section="battery" data-schema-anchor="charging-curve"></div>
                 </div>
 

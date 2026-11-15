@@ -13,10 +13,13 @@ from src.interfaces.charging_curve import (
     builtin_curve_points,
     builtin_power_at,
     concave_envelope,
+    concave_pieces,
     curve_power_at,
     envelope_deviation,
+    envelope_exact_up_to,
     envelope_segments,
     full_range_points,
+    limited_pieces,
     parse_curve_points,
     validate_curve_text,
 )
@@ -157,3 +160,41 @@ def test_every_segment_line_lies_on_or_above_the_envelope():
 
 def test_a_flat_curve_is_one_flat_segment():
     assert envelope_segments([(50.0, 3000.0)]) == [(0.0, 3000.0, 0.0)]
+
+
+SIMON = "0:6000, 90:6000, 91:3200, 93:1600, 95:1000, 97:700, 98:500"
+
+
+def test_a_concave_curve_is_one_piece_and_exact_everywhere():
+    concave = [(0.0, 6000.0), (80.0, 6000.0), (90.0, 5000.0), (100.0, 1000.0)]
+    assert len(concave_pieces(concave)) == 1
+    assert envelope_exact_up_to(concave) == 100.0
+
+
+def test_a_curve_is_cut_where_it_bends_upward():
+    pieces = concave_pieces(parse_curve_points(SIMON, MAX_W))
+    assert [(lo, hi) for lo, hi, _ in pieces] == [
+        (0.0, 91.0), (91.0, 93.0), (93.0, 95.0), (95.0, 98.0), (98.0, 100.0),
+    ]
+    # Each piece is the minimum of its own lines, which reproduces the curve.
+    points = parse_curve_points(SIMON, MAX_W)
+    for soc in (50, 90.5, 92, 94, 96, 97.5, 99):
+        lo, hi, lines = next(p for p in pieces if p[0] <= soc <= p[1])
+        assert min(p0 + k * (soc - s0) for s0, p0, k in lines) == pytest.approx(
+            curve_power_at(points, soc)
+        )
+
+
+def test_the_envelope_is_exact_up_to_the_first_upward_bend():
+    assert envelope_exact_up_to(parse_curve_points(SIMON, MAX_W)) == 90.0
+
+
+def test_merging_keeps_the_cuts_that_best_preserve_the_charging_time():
+    points = parse_curve_points(SIMON, MAX_W)
+    merged = limited_pieces(points, 3)
+    assert [(lo, hi) for lo, hi, _ in merged] == [(0.0, 93.0), (93.0, 98.0), (98.0, 100.0)]
+    # A merged piece follows the hull of its points: generous inside, never below.
+    for soc in (91, 92, 94, 95, 97):
+        lo, hi, lines = next(p for p in merged if p[0] <= soc <= p[1])
+        assert min(p0 + k * (soc - s0) for s0, p0, k in lines) >= curve_power_at(points, soc) - 1e-6
+    assert limited_pieces(points, 9) == concave_pieces(points)

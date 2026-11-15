@@ -17,6 +17,7 @@ Everything here is a pure function on plain numbers so the battery interface, th
 config validation and the optimizer backend all read the same curve.
 """
 
+import itertools
 import re
 
 # Shown in the UI and in every parse error, so the format is never a guess.
@@ -245,3 +246,113 @@ def envelope_segments(points):
     for (s0, p0), (s1, p1) in zip(hull, hull[1:]):
         segments.append((s0, p0, (p1 - p0) / (s1 - s0)))
     return segments
+
+
+def concave_pieces(points, tolerance_w_per_percent=1e-6):
+    """
+    Split the curve into stretches that are each concave on their own.
+
+    A concave stretch is the minimum of the lines through its segments, which a
+    linear program holds exactly. Where the curve bends upward - the slope gets
+    *less* steep - a new stretch begins. A concave curve comes back as one piece;
+    a curve like '90:6000, 91:3200, 93:1600, 95:1000' as several, and the solver
+    then decides per slot which stretch the state of charge is in.
+
+    Returns ``[(soc_from, soc_to, [(soc_anchor, power, slope_w_per_percent), ...]),
+    ...]`` over the full 0-100 % range (see :func:`full_range_points`).
+    """
+    pts = full_range_points(points)
+    # Drop points that sit on a straight line between their neighbours.
+    slopes = [(p1 - p0) / (s1 - s0) for (s0, p0), (s1, p1) in zip(pts, pts[1:])]
+    pieces = []
+    start = 0
+    for i in range(1, len(slopes)):
+        if slopes[i] > slopes[i - 1] + tolerance_w_per_percent:
+            pieces.append((start, i))
+            start = i
+    pieces.append((start, len(slopes)))
+    result = []
+    for first, last in pieces:
+        segment_lines = []
+        for k in range(first, last):
+            line = (pts[k][0], pts[k][1], slopes[k])
+            if segment_lines and abs(segment_lines[-1][2] - line[2]) <= tolerance_w_per_percent:
+                continue  # collinear with the previous segment
+            segment_lines.append(line)
+        result.append((pts[first][0], pts[last][0], segment_lines))
+    return result
+
+
+def envelope_exact_up_to(points, tolerance_w=1e-6):
+    """
+    The SOC up to which the concave envelope *is* the curve.
+
+    Below it a plan built on the envelope is exact; above it the envelope can promise
+    more than the battery takes. A concave curve returns 100.
+    """
+    pts = full_range_points(points)
+    hull = concave_envelope(pts)
+    exact_to = pts[0][0]
+    for soc, power in pts:
+        if curve_power_at(hull, soc) - power > tolerance_w:
+            return exact_to
+        if any(abs(soc - h_soc) <= 1e-9 for h_soc, _ in hull):
+            exact_to = soc
+    return 100.0
+
+
+def _hull_lines(points):
+    """Segment lines of the concave hull of *points* (which span one piece)."""
+    hull = concave_envelope(points)
+    if len(hull) == 1:
+        return [(hull[0][0], hull[0][1], 0.0)]
+    return [(s0, p0, (p1 - p0) / (s1 - s0)) for (s0, p0), (s1, p1) in zip(hull, hull[1:])]
+
+
+def _piece_value(pieces, soc):
+    """Power of a list of pieces at *soc*: the minimum of the lines of its piece."""
+    for _, hi, lines in pieces:
+        if soc <= hi + 1e-9:
+            return min(p + k * (soc - s0) for s0, p, k in lines)
+    lines = pieces[-1][2]
+    return min(p + k * (soc - s0) for s0, p, k in lines)
+
+
+def limited_pieces(points, max_pieces):
+    """
+    :func:`concave_pieces`, merged down to at most *max_pieces*.
+
+    Every extra piece costs the solver a binary per slot, and the solve time grows
+    quickly with it. When the curve has more upward bends than that, neighbouring
+    pieces are merged and each merged piece follows the concave hull of its points -
+    generous inside, like the envelope, but only there. The cuts kept are the ones
+    that best preserve how long the battery takes to fill: the error is measured as
+    charging time over the stretches the merge touches.
+    """
+    exact = concave_pieces(points)
+    if max_pieces < 1 or len(exact) <= max_pieces:
+        return exact
+    pts = full_range_points(points)
+    cuts = [lo for lo, _, _ in exact[1:]]
+    # Merging can only make the curve more generous where it bends upward, which
+    # starts where the envelope stops being exact.
+    start = envelope_exact_up_to(points)
+    grid = [start + (100.0 - start) * (j + 0.5) / 400 for j in range(400)]
+    truth = [max(curve_power_at(pts, soc), 1e-6) for soc in grid]
+
+    def build(kept):
+        bounds = [0.0] + list(kept) + [100.0]
+        pieces = []
+        for lo, hi in zip(bounds, bounds[1:]):
+            inside = [(soc, w) for soc, w in pts if lo - 1e-9 <= soc <= hi + 1e-9]
+            pieces.append((lo, hi, _hull_lines(inside)))
+        return pieces
+
+    def lost_time(pieces):
+        return sum(
+            1.0 / w - 1.0 / max(_piece_value(pieces, soc), 1e-6)
+            for soc, w in zip(grid, truth)
+        )
+
+    candidates = [build(kept) for kept in itertools.combinations(cuts, max_pieces - 1)]
+    return min(candidates, key=lost_time)

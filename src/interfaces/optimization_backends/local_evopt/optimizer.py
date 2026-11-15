@@ -231,16 +231,37 @@ class BatteryConfig:
     c_priority: int = 0
     # Emergency reserve: minimum end-of-horizon SOC in Wh (EOS_connect extension)
     s_reserve: float = 0.0
-    # SOC-dependent charge limit (EOS_connect extension): lines
-    # ``(s_anchor_wh, power_w, slope_w_per_wh)``, each an upper bound on the charge
-    # power as a function of the slot's average state of charge,
-    # ``power_w + slope_w_per_wh * (s_avg - s_anchor_wh)``. Pass the segments of a
-    # concave curve - its minimum over the lines is then the curve itself.
-    charge_limits: Optional[List[Tuple[float, float, float]]] = None
+    # SOC-dependent charge limit (EOS_connect extension), see ChargeCurveConfig.
+    charge_curve: Optional["ChargeCurveConfig"] = None
 
     def __post_init__(self):
         if self.s_capacity is None:
             self.s_capacity = self.s_max
+
+
+@dataclass
+class ChargeCurveConfig:
+    """
+    The battery's charging curve in the solver's units (EOS_connect extension).
+
+    The charge in a slot is held under the curve at the slot's average state of
+    charge. Every line is ``(s_anchor_wh, power_w, slope_w_per_wh)`` and stands for
+    ``power_w + slope_w_per_wh * (s_avg - s_anchor_wh)``.
+
+    Attributes:
+        pieces: The curve cut into concave stretches,
+            ``(s_from_wh, s_to_wh, [line, ...])``; within a stretch the limit is the
+            minimum of its lines. One piece means the curve is concave and the whole
+            thing is linear.
+        envelope: Lines of the smallest concave curve on or above the real one. On
+            its own it keeps the problem linear and is exact up to
+            ``envelope_exact_below``, generous above.
+        envelope_exact_below: Wh of state of charge up to which the envelope equals
+            the curve.
+    """
+    pieces: List[Tuple[float, float, List[Tuple[float, float, float]]]]
+    envelope: List[Tuple[float, float, float]]
+    envelope_exact_below: float
 
 
 @dataclass
@@ -370,6 +391,8 @@ class Optimizer:
         self.problem = None
         # dictionary of optimizer variables
         self.variables: Dict[str, Any] = {}
+        # Slots whose charging curve is held exactly, per battery (see solve()).
+        self._curve_exact_slots: Dict[int, set] = {i: set() for i in range(len(batteries))}
 
         # Compute scaling for strategy control parameters
         self.min_import_price = np.min(self.time_series.p_N) if self.time_series.p_N else 0.0
@@ -912,7 +935,7 @@ class Optimizer:
                     - (1 / self.eta_d) * self.variables['d'][i][t]
                 )
 
-            if bat.charge_limits:
+            if bat.charge_curve is not None:
                 self._add_charge_curve_constraints(i, bat)
 
             # SOC goal constraints (for t > 0)
@@ -1007,6 +1030,17 @@ class Optimizer:
                     >= bat.s_reserve
                 )
 
+    @staticmethod
+    def _binding_lines(lines, s_from, s_to, c_max):
+        """The lines that dip below ``c_max`` somewhere between s_from and s_to."""
+        kept = []
+        for s_anchor, power, slope in lines:
+            lowest = min(power + slope * (s_from - s_anchor),
+                         power + slope * (s_to - s_anchor))
+            if lowest < c_max:
+                kept.append((float(s_anchor), float(power), float(slope)))
+        return kept
+
     def _add_charge_curve_constraints(self, i, bat):
         """
         Hold each slot's charge under the battery's charging curve (EOS_connect extension).
@@ -1018,29 +1052,99 @@ class Optimizer:
         average is still linear in the variables: ``s[t]`` already contains this
         slot's charge, so the charge simply appears on both sides.
 
-        A line that stays at or above ``c_max`` across the whole state of charge range
-        can never bind and is not added.
+        A concave curve is the minimum of its lines and needs nothing else. A curve
+        that bends upward somewhere - a hard drop followed by a long tail is the
+        common shape - cannot be written that way. Slots listed in
+        ``_curve_exact_slots`` then get a binary per concave piece that says which
+        piece the state of charge is in; all others get the envelope, which is exact
+        as long as they stay below ``envelope_exact_below``. :meth:`solve` moves a
+        slot into the exact set when the plan takes it above that.
         """
+        curve = bat.charge_curve
         cap = float(bat.s_capacity or 0.0)
-        lines = []
-        for s_anchor, power, slope in bat.charge_limits:
-            at_empty = power + slope * (0.0 - s_anchor)
-            at_full = power + slope * (cap - s_anchor)
-            if min(at_empty, at_full) >= bat.c_max:
-                continue
-            lines.append((float(s_anchor), float(power), float(slope)))
-        if not lines:
-            return
+        envelope = self._binding_lines(curve.envelope, 0.0, cap, bat.c_max)
+        pieces = [
+            (float(lo), float(hi), self._binding_lines(lines, lo, hi, bat.c_max))
+            for lo, hi, lines in curve.pieces
+        ]
+        exact_slots = self._curve_exact_slots.get(i, set()) if len(pieces) > 1 else set()
+        self.variables.setdefault('z_curve', {})[i] = {}
 
         for t in self.time_steps:
             dt_h = self.time_series.dt[t] / 3600.0
             s_start = bat.s_initial if t == 0 else self.variables['s'][i][t - 1]
             s_avg = 0.5 * (s_start + self.variables['s'][i][t])
-            for s_anchor, power, slope in lines:
-                self.problem += (
-                    self.variables['c'][i][t]
-                    <= dt_h * (power + slope * (s_avg - s_anchor))
-                )
+            if t not in exact_slots:
+                for s_anchor, power, slope in envelope:
+                    self.problem += (
+                        self.variables['c'][i][t]
+                        <= dt_h * (power + slope * (s_avg - s_anchor))
+                    )
+                continue
+            # Disaggregated ("convex hull") formulation: the slot's state of charge
+            # and charge are split over the pieces, and only the chosen piece may
+            # carry any. Its linear relaxation is exactly the envelope, so the
+            # solver starts from the fast plan and only has to branch where the
+            # envelope and the curve disagree - far tighter than big-M switches.
+            z = [self._new_var(f"z_curve_{i}_{t}_{k}", cat='Binary')
+                 for k in range(len(pieces))]
+            s_k = [self._new_var(f"s_curve_{i}_{t}_{k}", lowBound=0)
+                   for k in range(len(pieces))]
+            c_k = [self._new_var(f"c_curve_{i}_{t}_{k}", lowBound=0)
+                   for k in range(len(pieces))]
+            self.variables['z_curve'][i][t] = z
+            self.problem += pulp.lpSum(z) == 1
+            self.problem += pulp.lpSum(s_k) == s_avg
+            self.problem += pulp.lpSum(c_k) == self.variables['c'][i][t]
+            c_cap = bat.c_max * dt_h
+            for k, (s_from, s_to, lines) in enumerate(pieces):
+                self.problem += s_k[k] >= s_from * z[k]
+                self.problem += s_k[k] <= s_to * z[k]
+                self.problem += c_k[k] <= c_cap * z[k]
+                for s_anchor, power, slope in lines:
+                    self.problem += (
+                        c_k[k]
+                        <= dt_h * (power * z[k] + slope * (s_k[k] - s_anchor * z[k]))
+                    )
+
+    @staticmethod
+    def _curve_power_at(curve, s_wh):
+        """Power the curve allows at *s_wh*: the minimum of the lines of its piece."""
+        for s_from, s_to, lines in curve.pieces:
+            if s_wh <= s_to + 1e-9:
+                return min(power + slope * (s_wh - s_anchor)
+                           for s_anchor, power, slope in lines)
+        s_from, s_to, lines = curve.pieces[-1]
+        return min(power + slope * (s_wh - s_anchor) for s_anchor, power, slope in lines)
+
+    def _curve_slots_beyond_envelope(self):
+        """
+        Slots the last solve planned to charge faster than the curve allows, per battery.
+
+        Only a slot above ``envelope_exact_below`` that also charges can be one: a full
+        battery sitting at 98 % with nothing going in obeys any curve. Checking the
+        charge rather than the state of charge keeps the exact set to the handful of
+        slots where the battery really fills.
+        """
+        found = {}
+        for i, bat in enumerate(self.batteries):
+            curve = bat.charge_curve
+            if curve is None or len(curve.pieces) <= 1:
+                continue
+            exact = self._curve_exact_slots.setdefault(i, set())
+            s_vals = [pulp.value(var) or 0.0 for var in self.variables['s'][i]]
+            c_vals = [pulp.value(var) or 0.0 for var in self.variables['c'][i]]
+            new = set()
+            for t in self.time_steps:
+                if t in exact:
+                    continue
+                s_start = bat.s_initial if t == 0 else s_vals[t - 1]
+                s_avg = 0.5 * (s_start + s_vals[t])
+                if s_avg > curve.envelope_exact_below + 1e-6:
+                    new.add(t)
+            if new:
+                found[i] = new
+        return found
 
     def _add_managed_load_constraints(self):
         """
@@ -1228,6 +1332,9 @@ class Optimizer:
         for t in self.time_steps:
             self.problem += starts[t] >= edge(t)
 
+    # Upper bound on re-solves for a non-concave charging curve (see solve()).
+    CURVE_REFINE_ROUNDS = 6
+
     def solve(self) -> Dict:
         """
         Creates the MILP model if none exists and solves the optimization problem.
@@ -1246,6 +1353,22 @@ class Optimizer:
         with TemporaryDirectory() as tmpdir:
             solver.tmpDir = tmpdir
             self.problem.solve(solver)
+            # A charging curve that is not concave is first planned along its
+            # envelope, which is linear and fast. Wherever that plan takes the state
+            # of charge above the point where the envelope stops being exact, those
+            # slots get the exact formulation and the problem is solved again. The
+            # final plan obeys the curve in every slot: the remaining slots stay
+            # below that point, where envelope and curve agree. Usually one round.
+            for _ in range(self.CURVE_REFINE_ROUNDS):
+                if pulp.LpStatus[self.problem.status] != 'Optimal':
+                    break
+                beyond = self._curve_slots_beyond_envelope()
+                if not beyond:
+                    break
+                for i, slots in beyond.items():
+                    self._curve_exact_slots[i] |= slots
+                self.create_model()
+                self.problem.solve(solver)
 
         status = pulp.LpStatus[self.problem.status]
 
