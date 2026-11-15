@@ -1602,3 +1602,47 @@ class TestResolvingAConfigurationThatIsNotSavedYet:
 
     def test_an_empty_body_is_the_saved_answer(self, wizard_client):
         assert wizard_client.post("/api/config/resolved", json={}).get_json() == {}
+
+
+class TestChargingCurvePoints:
+    """battery.charging_curve_points is parsed on save, not only at runtime."""
+
+    def test_a_good_curve_is_saved(self, client):
+        resp = client.put(
+            "/api/config/",
+            data=json.dumps({"battery.charging_curve_points": "0:5000, 90:5000, 100:800"}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        assert client.store.get("battery.charging_curve_points") == "0:5000, 90:5000, 100:800"
+
+    def test_a_curve_that_does_not_parse_is_refused_with_the_reason(self, client):
+        resp = client.put(
+            "/api/config/",
+            data=json.dumps({"battery.charging_curve_points": "90:5000, 120:800"}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 422
+        errors = resp.get_json()["errors"]
+        assert errors[0]["key"] == "battery.charging_curve_points"
+        assert "between 0 and 100" in errors[0]["error"]
+        assert client.store.get("battery.charging_curve_points") in (None, "")
+
+    def test_percentages_are_checked_against_the_maximum_in_the_same_request(self, client):
+        resp = client.post(
+            "/api/config/validate",
+            data=json.dumps({
+                "battery.max_charge_power_w": 4000,
+                "battery.charging_curve_points": "90:100%, 100:15%",
+            }),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+
+    def test_an_empty_curve_is_allowed(self, client):
+        resp = client.put(
+            "/api/config/",
+            data=json.dumps({"battery.charging_curve_points": ""}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
