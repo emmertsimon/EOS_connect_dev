@@ -321,7 +321,8 @@ class LocalEVOptBackend(EVOptBackend):
         if stretches > self.MAX_CHARGE_CURVE_PIECES:
             return (
                 f" (exact, merged from {stretches} to {self.MAX_CHARGE_CURVE_PIECES}"
-                f" stretches to keep the solve fast)"
+                f" stretches to keep the solve fast - planned slightly under the"
+                f" curve where merged, never above it)"
             )
         return f" (exact, {stretches} stretches)"
 
