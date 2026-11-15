@@ -49,6 +49,7 @@ Modifications made for EOS_connect integration (adapted from main branch, ~2025-
 import logging
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Tuple
@@ -1296,12 +1297,13 @@ class Optimizer:
 
     def _curve_slots_beyond_envelope(self):
         """
-        Slots the last solve planned to charge faster than the curve allows, per battery.
+        Slots the last solve took above ``envelope_exact_below``, per battery.
 
-        Only a slot above ``envelope_exact_below`` that also charges can be one: a full
-        battery sitting at 98 % with nothing going in obeys any curve. Checking the
-        charge rather than the state of charge keeps the exact set to the handful of
-        slots where the battery really fills.
+        Above that point the envelope may promise more than the curve, below it the two
+        agree. A slot up there that charges nothing obeys any curve, but it is taken
+        all the same: picking only the charging ones lets the next solve simply move
+        the charge into a neighbouring high slot, one round per move. Taking them all
+        settles a plan in one or two rounds, and their few binaries cost little.
         """
         found = {}
         for i, bat in enumerate(self.batteries):
@@ -1634,8 +1636,75 @@ class Optimizer:
         for t in self.time_steps:
             self.problem += starts[t] >= edge(t)
 
+    def _refine_charge_curve(self, solver, first_solve_s):
+        """
+        Re-solve with the exact curve wherever the envelope is not exact (see below).
+
+        A charging curve that is not concave is first planned along its envelope,
+        which is linear and fast. Wherever that plan takes the state of charge above
+        the point where the envelope stops being exact, those slots get the exact
+        formulation and the problem is solved again; the remaining slots stay below
+        that point, where envelope and curve agree. Usually one or two rounds.
+
+        The rounds share a time budget. A round that runs out of it keeps the best
+        plan the solver found by then - that one obeys the curve too. If it found
+        none, the plan of the round before stands, and the log names the slots in
+        which it may count on more than the curve allows.
+        """
+        budget = max(self.CURVE_REFINE_BUDGET_MIN_S,
+                     self.CURVE_REFINE_BUDGET_FACTOR * first_solve_s)
+        if self.settings.time_limit:
+            budget = min(budget, float(self.settings.time_limit))
+        deadline = time.monotonic() + budget
+        own_limit = solver.timeLimit
+        try:
+            for _ in range(self.CURVE_REFINE_ROUNDS):
+                if pulp.LpStatus[self.problem.status] != 'Optimal':
+                    return
+                beyond = self._curve_slots_beyond_envelope()
+                if not beyond:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining < 0.5:
+                    self._warn_curve_not_refined(beyond, budget)
+                    return
+                previous = (
+                    self.problem,
+                    {key: dict(val) if isinstance(val, dict) else val
+                     for key, val in self.variables.items()},
+                    {i: set(slots) for i, slots in self._curve_exact_slots.items()},
+                )
+                for i, slots in beyond.items():
+                    self._curve_exact_slots[i] |= slots
+                self.create_model()
+                solver.timeLimit = remaining if own_limit is None else min(own_limit, remaining)
+                self.problem.solve(solver)
+                if pulp.LpStatus[self.problem.status] != 'Optimal':
+                    self.problem, self.variables, self._curve_exact_slots = previous
+                    self._warn_curve_not_refined(beyond, budget)
+                    return
+        finally:
+            solver.timeLimit = own_limit
+
+    @staticmethod
+    def _warn_curve_not_refined(beyond, budget):
+        slots = sorted(t for found in beyond.values() for t in found)
+        logger.warning(
+            "[OPT-LocalEVopt] Charging curve: no exact plan within %.0f s - keeping "
+            "the envelope plan, which may count on charging faster than the curve "
+            "allows in %d slot(s) near full (first: %s)",
+            budget, len(slots), slots[:5],
+        )
+
     # Upper bound on re-solves for a non-concave charging curve (see solve()).
     CURVE_REFINE_ROUNDS = 6
+    # Wall time the re-solves may take together: this many times the first solve, and
+    # at least the floor. Branch and bound on the curve's binaries is usually quick,
+    # but next to other binaries (a heat pump's runtime blocks, say) it can now and
+    # then run long - and a plan that is a little hopeful near full is better than
+    # one that arrives a minute late.
+    CURVE_REFINE_BUDGET_FACTOR = 4.0
+    CURVE_REFINE_BUDGET_MIN_S = 5.0
 
     def solve(self) -> Dict:
         """
@@ -1654,23 +1723,9 @@ class Optimizer:
 
         with TemporaryDirectory() as tmpdir:
             solver.tmpDir = tmpdir
+            started = time.monotonic()
             self.problem.solve(solver)
-            # A charging curve that is not concave is first planned along its
-            # envelope, which is linear and fast. Wherever that plan takes the state
-            # of charge above the point where the envelope stops being exact, those
-            # slots get the exact formulation and the problem is solved again. The
-            # final plan obeys the curve in every slot: the remaining slots stay
-            # below that point, where envelope and curve agree. Usually one round.
-            for _ in range(self.CURVE_REFINE_ROUNDS):
-                if pulp.LpStatus[self.problem.status] != 'Optimal':
-                    break
-                beyond = self._curve_slots_beyond_envelope()
-                if not beyond:
-                    break
-                for i, slots in beyond.items():
-                    self._curve_exact_slots[i] |= slots
-                self.create_model()
-                self.problem.solve(solver)
+            self._refine_charge_curve(solver, time.monotonic() - started)
 
         status = pulp.LpStatus[self.problem.status]
 
