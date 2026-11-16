@@ -1,1 +1,1 @@
-__version__ = "0.3.42.400-develop+pr368+curve+limit+mod+copair+gatefix+loss.f246d963"
+__version__ = "0.3.42.400-develop+pr368+curve+limit+mod+copair+gatefix+loss.891d64db"
