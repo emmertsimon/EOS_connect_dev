@@ -204,3 +204,53 @@ def test_a_broken_modulation_curve_is_dropped_with_a_warning(make_manager, insta
     record = manager.schedulable()[0]
     assert record["min_power_w"] == 300 and record["heat_lines"] == []
     assert "modulation_cop ignored" in caplog.text
+
+# --- what counts as "planned to run" ----------------------------------------------------------
+
+def test_solver_residue_in_the_running_slot_does_not_release(make_manager, installation):
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    plan = [0.0] * 48
+    plan[6] = 1e-6
+    release = item.adopt_schedule(plan, manager._last_ctx_for["house"])
+    assert release["released"] is False
+
+
+def test_residue_does_not_hold_a_running_appliance_on(make_manager, installation):
+    """The latch seen live: released once, then held all night by a 0 W plan."""
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    ctx = manager._last_ctx_for["house"]
+    plan = [0.0] * 48
+    plan[6] = 900.0
+    assert item.adopt_schedule(plan, ctx)["released"] is True
+    plan[6] = 3e-4
+    assert item.adopt_schedule(plan, ctx)["released"] is False
+
+
+def test_a_run_in_the_last_seconds_of_a_slot_still_counts(make_manager, installation):
+    import dataclasses
+    from datetime import timedelta
+
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    ctx = manager._last_ctx_for["house"]
+    slot_end = ctx.anchor + timedelta(seconds=(ctx.current_slot + 1) * ctx.time_frame_base)
+    late = dataclasses.replace(ctx, now=slot_end - timedelta(seconds=90))
+    plan = [0.0] * 48
+    plan[6] = 900.0 * 90 / 3600  # the rating, for the 90 s that are left
+    assert item.adopt_schedule(plan, late)["released"] is True
+
+
+def test_residue_is_not_reported_as_the_next_start(make_manager, installation):
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    plan = [0.0] * 48
+    plan[10] = 2e-5
+    release = item.adopt_schedule(plan, manager._last_ctx_for["house"])
+    assert release["next_release_start"] is None
+    assert item.last_plan[10] == 0.0

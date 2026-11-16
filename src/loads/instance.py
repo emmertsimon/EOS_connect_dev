@@ -74,6 +74,8 @@ def _offerable(demand):
 # skipped cycle, short enough that a wedged poll thread stops inflating the forecast
 # instead of holding a stale demand there for a day.
 _INTERNAL_TTL_CYCLES = 3
+# Below this a slot's planned energy is solver residue, not a plan (see _gate_on).
+RUN_THRESHOLD_MIN_WH = 1.0
 _INTERNAL_TTL_MIN_MINUTES = 15
 
 
@@ -442,7 +444,12 @@ class ManagedLoad:
         """
         if self.last_demand is None or self.gate is None:
             return None
-        plan = [max(0.0, float(value or 0.0)) for value in schedule]
+        # Solver residue is not a plan: below a watt-hour a slot is empty, for the
+        # reports and the next start as much as for the gate.
+        plan = [
+            value if value >= RUN_THRESHOLD_MIN_WH else 0.0
+            for value in (max(0.0, float(value or 0.0)) for value in schedule)
+        ]
         if len(plan) < ctx.slot_count:
             plan += [0.0] * (ctx.slot_count - len(plan))
         self.last_plan = plan[: ctx.slot_count]
@@ -496,7 +503,8 @@ class ManagedLoad:
         """Turn a placement into a release decision."""
         active = self._active(demand, scheduled)
         planned_now = (
-            0 <= ctx.current_slot < len(plan) and plan[ctx.current_slot] > 0
+            0 <= ctx.current_slot < len(plan)
+            and plan[ctx.current_slot] >= self._run_threshold_wh(demand, ctx)
         )
         release = self.gate.evaluate(
             planned=planned_now,
@@ -507,6 +515,38 @@ class ManagedLoad:
         release["next_release_start"] = self._next_release_start(plan, ctx)
         release["energy_needed_wh"] = round(demand.total_wh, 1)
         return release
+
+    @staticmethod
+    def _run_threshold_wh(demand, ctx):
+        """
+        The least energy in the running slot that counts as "planned to run".
+
+        A solver hands back floats, and the slot that is running is only the part of
+        it still ahead. Anything above zero used to release the appliance: a residue
+        of 1e-6 Wh from the solver's integrality tolerance did, and so did the few
+        Wh of a minimum run squeezed into the last seconds of a slot. Once released,
+        the next plan saw the appliance running and found continuing cheaper than a
+        fresh start, so the residue held the gate open indefinitely - on a live heat
+        pump, a whole night of heating the plan itself had put at 0 W.
+
+        Half of what the appliance draws in the time left of the slot: its minimum
+        for a modulating one, its rating otherwise, at 5 % - a fraction of a slot is a
+        plan for an on/off appliance, a tenth of a watt is not. Never below 1 Wh.
+        """
+        hours_left = ctx.hours_per_slot()
+        anchor = getattr(ctx, "anchor", None)
+        if anchor is not None and ctx.now is not None:
+            slot_end = anchor + timedelta(
+                seconds=(ctx.current_slot + 1) * ctx.time_frame_base
+            )
+            hours_left = max(60.0, (slot_end - ctx.now).total_seconds()) / 3600.0
+            hours_left = min(hours_left, ctx.hours_per_slot())
+        floor_w = float(getattr(demand, "min_power_w", 0.0) or 0.0)
+        share = 0.5
+        if floor_w <= 0:
+            floor_w = float(demand.max_power_w or 0.0)
+            share = 0.05
+        return max(RUN_THRESHOLD_MIN_WH, share * floor_w * hours_left)
 
     def _mask_current_slot(self, demand, ctx, scheduled=False):
         """
