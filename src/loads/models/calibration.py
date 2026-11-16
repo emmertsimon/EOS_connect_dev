@@ -156,10 +156,28 @@ RIDGE_SAMPLES = 2.0
 # anywhere between 8 and 70 W/K from one restart to the next. Below this the loss is
 # held at its prior exactly like an unidentified cover or sun term.
 LOSS_FIT_MIN_ROWS = 12
+# Share of the windows' heat flow a fitted loss has to explain to be kept. Measured on
+# a house with a metered COP: 6 % - the windows were noise, and the loss with them.
+LOSS_FIT_MIN_QUALITY = 0.3
 
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _explained(estimate, weights, design, targets):
+    """Share of the targets' weighted RMS that *estimate* accounts for, 0 to 1."""
+    total = sum(weights)
+    if total <= 0:
+        return 0.0
+    signal = sum(w * targets[i] ** 2 for i, w in enumerate(weights)) / total
+    if signal <= 0:
+        return 0.0
+    error = sum(
+        w * (targets[i] - sum(design[i][c] * estimate[c] for c in range(len(estimate)))) ** 2
+        for i, w in enumerate(weights)
+    ) / total
+    return max(0.0, 1.0 - math.sqrt(error) / math.sqrt(signal))
 
 
 def _observed_ambient(sample):
@@ -711,17 +729,31 @@ class ThermalCalibrator:
             pinned[4] = True
         if len(rows) < LOSS_FIT_MIN_ROWS:
             pinned[2] = pinned[3] = True
-        for col in range(UNKNOWNS):
-            strength = ridge * 1e9 if pinned[col] else ridge
-            normal[col][col] += strength
-            rhs[col] += strength * prior_scaled[col]
 
-        solution = _solve(normal, rhs)
-        if solution is None:
+        def solve(pins):
+            system = [list(row) for row in normal]
+            right = list(rhs)
+            for col in range(UNKNOWNS):
+                strength = ridge * 1e9 if pins[col] else ridge
+                system[col][col] += strength
+                right[col] += strength * prior_scaled[col]
+            found = _solve(system, right)
+            return None if found is None else [
+                found[col] / scales[col] for col in range(UNKNOWNS)
+            ]
+
+        estimate = solve(pinned)
+        if estimate is None:
             logger.debug("[LOADS] calibration fit is singular - keeping the last estimate")
             return False
-
-        estimate = [solution[col] / scales[col] for col in range(UNKNOWNS)]
+        if not (pinned[2] and pinned[3]) and _explained(
+            estimate, weights, design, targets
+        ) < LOSS_FIT_MIN_QUALITY:
+            # A loss the windows cannot explain is not a measurement of the loss: keep
+            # the configured one rather than whatever the noise happened to average to.
+            held_loss = list(pinned)
+            held_loss[2] = held_loss[3] = True
+            estimate = solve(held_loss) or estimate
         self._apply(estimate, rows, weights, design, targets)
         if metered is not None:
             self.cop_source = "heat_meter"

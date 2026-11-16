@@ -297,6 +297,22 @@ def test_with_enough_windows_the_loss_is_learned():
     assert calibrator.loss_coefficient == pytest.approx(TRUE_K, rel=0.1)
 
 
+def test_a_loss_the_windows_cannot_explain_stays_at_its_prior():
+    """A room average read to a tenth, wobbling with doors and sun: the windows are
+    noise, and a loss fitted to them would be too."""
+    import random
+
+    rng = random.Random(7)
+    samples = _simulate(days=3, heat_meter=True)
+    for sample in samples:
+        sample["medium_c"] = round(sample["medium_c"] + rng.uniform(-0.3, 0.3), 1)
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.observe_series(samples)
+    assert len(calibrator._rows) >= 12  # pylint: disable=protected-access
+    assert calibrator.fit_quality() < 0.3
+    assert calibrator.loss_coefficient == pytest.approx(0.4)
+
+
 def test_a_heat_meter_that_never_moves_is_ignored():
     samples = _simulate(days=3, heat_meter=True)
     for sample in samples:
