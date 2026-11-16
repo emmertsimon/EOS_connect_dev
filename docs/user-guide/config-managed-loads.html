@@ -814,6 +814,11 @@
                         slope can be measured. An air limit (<code>min_ambient_temp_c</code>) applies to
                         the heat pump's air as well. Leave it empty where the store and the heat pump
                         share the air &mdash; a pool, or a house heated by its own heat pump.</p>
+                    <p>The sensor gives the model the right COP for each slot. Whether the plan
+                        then <em>prefers</em> the warm slots is the load's
+                        <a href="#managed-loads-efficiency"><code>efficiency_source</code></a>: set
+                        it to <code>cop</code>. Left <code>off</code>, a tank planned by energy is
+                        still sized with the right COP, but every slot counts the same.</p>
                     <p data-level="expert">Expect a smaller effect than on the space heating. Measured on a 360-litre tank
                         behind a floor-heating heat pump, the hot water COP rose by about 0.015&ndash;0.025
                         per kelvin of outdoor air (2.8 at 3&nbsp;&deg;C, 3.0 at 13&nbsp;&deg;C), where the
