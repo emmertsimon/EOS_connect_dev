@@ -150,6 +150,12 @@ WEIGHT_HALF_LIFE_HOURS = 7 * 24.0
 # physical bounds and from holding the slope when the ambient never varied, not from
 # leaning on the configuration.
 RIDGE_SAMPLES = 2.0
+# Windows the loss needs before the fit may move it off the configured value. A house
+# yields a usable window rarely - a room average moves by tenths of a kelvin while
+# tens of kWh/K of mass sit behind it - and four of them put a renovated 170 m2 house
+# anywhere between 8 and 70 W/K from one restart to the next. Below this the loss is
+# held at its prior exactly like an unidentified cover or sun term.
+LOSS_FIT_MIN_ROWS = 12
 
 
 def _clamp(value, low, high):
@@ -741,6 +747,8 @@ class ThermalCalibrator:
             pinned[2 if self._thin_state == "open" else 3] = True
         if not self.solar_identified:
             pinned[4] = True
+        if len(rows) < LOSS_FIT_MIN_ROWS:
+            pinned[2] = pinned[3] = True
         for col in range(UNKNOWNS):
             strength = ridge * 1e9 if pinned[col] else ridge
             normal[col][col] += strength
