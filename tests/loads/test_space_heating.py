@@ -282,6 +282,21 @@ def test_a_heat_meter_also_measures_where_the_cop_may_be_fitted():
     assert calibrator.cop_source == "heat_meter"
 
 
+def test_a_handful_of_windows_does_not_move_the_loss():
+    """Half a day gives a few noisy windows; the configured loss stands until there
+    are enough to outweigh it."""
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.observe_series(_simulate(days=0.5))
+    assert len(calibrator._rows) < 12  # pylint: disable=protected-access
+    assert calibrator.loss_coefficient == pytest.approx(0.4)
+
+
+def test_with_enough_windows_the_loss_is_learned():
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.observe_series(_simulate(days=2))
+    assert calibrator.loss_coefficient == pytest.approx(TRUE_K, rel=0.1)
+
+
 def test_a_heat_meter_that_never_moves_is_ignored():
     samples = _simulate(days=3, heat_meter=True)
     for sample in samples:
