@@ -125,6 +125,11 @@ class ManagedLoad:
         # household forecast *and* offer it to the solver at the same time.
         self.last_schedule_at = None
         self.waiting_for_schedule_since = None
+        # The moment the plan in force was drawn up for. A solver plans the slot that
+        # is running only from there to the slot's end, so the energy it puts there
+        # covers that remainder and not a whole slot. None for this module's own plan,
+        # which fills whole slots.
+        self.last_plan_from = None
         # Whether the fallback planner currently owns the placement - i.e. the last
         # schedule is older than the manager's staleness age and this load has been
         # handed back to this module's own plan. The cycle sets it when the schedule
@@ -390,6 +395,7 @@ class ManagedLoad:
         deferred = defer_gate and _offerable(demand)
         if not (deferred and self.last_schedule_at is not None):
             self.last_plan = plan
+            self.last_plan_from = None
         self.last_release = release
 
         if not any(plan):
@@ -431,7 +437,7 @@ class ManagedLoad:
         efficiency = self.last_demand.efficiency if self.last_demand else None
         return slot_efficiency.effective_wh(plan, efficiency)
 
-    def adopt_schedule(self, schedule, ctx, cost=None):
+    def adopt_schedule(self, schedule, ctx, cost=None, planned_from=None):
         """
         Take a schedule somebody else produced, and gate on that instead.
 
@@ -439,6 +445,10 @@ class ManagedLoad:
         which is a better answer than this module can reach on its own. What does not
         change is that one series drives both the release signal and whatever is
         reported - the two cannot disagree, because there is only ever one plan.
+
+        *planned_from* is when the schedule's first slot started counting - the moment
+        the load was offered. It defaults to now, which is right for a schedule that
+        was made the instant it arrived.
         """
         if self.last_demand is None or self.gate is None:
             return None
@@ -447,6 +457,7 @@ class ManagedLoad:
             plan += [0.0] * (ctx.slot_count - len(plan))
         self.last_plan = plan[: ctx.slot_count]
         self.last_schedule_at = ctx.now
+        self.last_plan_from = planned_from or ctx.now
         # What the household actually pays extra, where the optimizer measured it. The
         # tariff of the occupied hours is the fallback, and only a rough guide: it
         # cannot see that the energy came from the roof, so a sunny day reads dearer
