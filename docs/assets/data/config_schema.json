@@ -3663,6 +3663,52 @@
       "display_group": "Temperature"
     },
     {
+      "key": "managed_loads.circuit_sensor",
+      "type": "sensor",
+      "default": "",
+      "section": "managed_loads",
+      "level": "expert",
+      "description": "Entity/item reporting whether the heat pump's own controller has the circuit switched on - e.g. its operating state, which reads 'off' in the summer shutdown. While it reads one of the off states nothing is planned or released, and the reason says so. Unavailable readings keep the last state for 30 minutes. Leave empty to ignore",
+      "labels": [
+        "restart_required"
+      ],
+      "help_url": "config-managed-loads.html#managed-loads-circuit",
+      "validation": {},
+      "depends_on": {
+        "type": [
+          "pool_heatpump",
+          "sauna",
+          "hot_water_tank",
+          "buffer_tank",
+          "space_heating"
+        ]
+      },
+      "hot_reload": false,
+      "display_group": "Temperature"
+    },
+    {
+      "key": "managed_loads.circuit_off_states",
+      "type": "str",
+      "default": "off",
+      "section": "managed_loads",
+      "level": "expert",
+      "description": "Comma-separated states of the circuit sensor that mean 'switched off' (case does not matter)",
+      "labels": [],
+      "help_url": "config-managed-loads.html#managed-loads-circuit",
+      "validation": {},
+      "depends_on": {
+        "type": [
+          "pool_heatpump",
+          "sauna",
+          "hot_water_tank",
+          "buffer_tank",
+          "space_heating"
+        ]
+      },
+      "hot_reload": false,
+      "display_group": "Temperature"
+    },
+    {
       "key": "managed_loads.volume_m3",
       "type": "float",
       "default": 30.0,
