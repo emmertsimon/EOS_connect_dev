@@ -821,6 +821,31 @@
                         &mdash; fewer than about three days &mdash; defers to the switch instead of
                         being guessed at.</p>
 
+                    <h3 id="managed-loads-circuit" data-level="expert">When the heat pump's controller switches the circuit off</h3>
+                    <p data-level="expert">A weather-compensated controller has the last word over its heating circuit.
+                        In summer mode it shuts the circuit down once the damped outdoor
+                        temperature is above its threshold, and then no release, setpoint or room
+                        thermostat makes the pump heat. EOS Connect cannot see that on its own: it
+                        would keep planning heat into hours that deliver none, size the battery
+                        around a load that never appears, and report the house as released while
+                        it cools.</p>
+                    <p data-level="expert">Point <strong>Circuit Sensor</strong> at whatever reports the circuit's state
+                        &mdash; on an EMS-ESP Bosch/Buderus system the circuit's heat pump
+                        operating state, which reads <code>off</code> in the summer shutdown and
+                        <code>heating</code> otherwise, also while the pump is idle. While it
+                        reads one of the <strong>Circuit Off States</strong> (default
+                        <code>off</code>) nothing is planned or offered to the optimizer, the
+                        release is withdrawn (a minimum-runtime hold included) and the reason reads
+                        <em>heating circuit off</em>; the energy the house would need stays on the
+                        card. The first cycle after it reads otherwise plans again. A gateway that
+                        drops out reads <code>unavailable</code>; that is not an off circuit, so the
+                        last definite state stands for 30 minutes before the circuit counts as on
+                        again.</p>
+                    <div class="alert alert-info" data-level="expert">
+                        <p>Use a state that only goes off when the controller itself blocks the
+                            circuit. A signal that also reads off whenever the room is warm enough
+                            would stop the plan from ever asking for heat.</p>
+                    </div>
                     <h3 id="managed-loads-ambient">Outdoor loads need an outdoor temperature</h3>
                     <p>A pool's losses and its heat pump's efficiency both turn on the air
                         temperature, so an outdoor managed load is only as good as the
