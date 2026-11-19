@@ -51,6 +51,10 @@ DEFAULT_HORIZON_HOURS = 48
 # between planners - but small enough that a dead solver keeps no load latched for long.
 SCHEDULER_GRACE_SECONDS = 120
 
+# The shortest remainder of a slot a planned energy is turned back into a power over.
+# Below it the figure is all rounding - and the appliance's rating caps it anyway.
+MIN_PLANNED_HOURS = 10.0 / 3600.0
+
 
 def _noop(*_args, **_kwargs):
     return None
@@ -691,13 +695,16 @@ class ManagedLoadManager:
                 continue
             # The optimizer has spoken, so the offer is settled and the solver owns
             # the placement until it stops answering.
+            offered_at = item.offered_at
             item.offered_at = None
             item.fallback_active = False
             ctx = self._last_ctx_for.get(item.id)
             if ctx is None:
                 continue
             ctx = self._at_now(ctx, now)
-            release = item.adopt_schedule(schedule, ctx, cost=cost)
+            release = item.adopt_schedule(
+                schedule, ctx, cost=cost, planned_from=offered_at
+            )
             if release is not None:
                 self._publish_release(item, release)
                 self._record_decision(item, ctx, release, origin=ORIGIN_OPTIMIZER)
@@ -850,16 +857,51 @@ class ManagedLoadManager:
 
         For a modulating appliance this is the setpoint the plan wants - something a
         release flag alone cannot carry. None before the first plan.
+
+        Read from *now*, as `adopt_schedules` does and for the same reason: the context
+        of the last poll cycle is up to a cycle old, and its slot may have ended. Asked
+        of that slot, a plan that starts in the running one answers 0 W for an appliance
+        it has just released.
         """
         ctx = self._last_ctx_for.get(item.id)
         plan = item.last_plan or []
         if ctx is None or not plan:
             return None
+        ctx = self._at_now(ctx, self._clock()[1])
         index = ctx.current_slot
         if not 0 <= index < len(plan):
             return 0.0
-        hours = ctx.hours_per_slot() or 1.0
-        return round(float(plan[index]) / hours, 1)
+        power = float(plan[index]) / self._planned_hours(item, ctx)
+        # The remainder of a slot can be seconds long, and a second of disagreement
+        # about where it began then doubles the figure. The rating is the one bound
+        # that is always true.
+        limit = float(getattr(item.last_demand, "max_power_w", 0.0) or 0.0)
+        if limit > 0:
+            power = min(power, limit)
+        return round(power, 1)
+
+    @staticmethod
+    def _planned_hours(item, ctx):
+        """
+        The hours the plan in force spread the running slot's energy over.
+
+        A whole slot, unless a solver drew the plan up partway through this very slot:
+        its first step runs from that moment to the slot's end, so 150 Wh planned ten
+        minutes into a quarter hour is 1800 W for the five minutes left and not 600 W.
+        """
+        whole = ctx.hours_per_slot() or 1.0
+        planned_from = item.last_plan_from
+        if planned_from is None:
+            return whole
+        slot_start = ctx.anchor + timedelta(
+            seconds=ctx.current_slot * ctx.time_frame_base
+        )
+        if planned_from <= slot_start:
+            return whole
+        left = (
+            slot_start + timedelta(seconds=ctx.time_frame_base) - planned_from
+        ).total_seconds() / 3600.0
+        return min(whole, max(left, MIN_PLANNED_HOURS))
 
     def _record_decision(self, item, ctx, release, origin):
         """

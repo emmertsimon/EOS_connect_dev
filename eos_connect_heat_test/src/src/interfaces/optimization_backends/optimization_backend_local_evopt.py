@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 try:
     from timeseries_grid import local_midnight
@@ -23,6 +23,7 @@ except ImportError:  # imported as src.interfaces (tests)
 from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
+    one_clock_per_run,
 )
 from ..charging_curve import (
     ChargingCurveError,
@@ -165,6 +166,7 @@ class LocalEVOptBackend(EVOptBackend):
     # top, and three keep a two-day quarter-hourly solve at a few seconds.
     MAX_CHARGE_CURVE_PIECES = 3
 
+    @one_clock_per_run
     def optimize(self, eos_request, timeout=180, managed_loads=None,
                  managed_load_budget_w=0.0, charge_power_limit=None):
         """
@@ -480,7 +482,7 @@ class LocalEVOptBackend(EVOptBackend):
     def _plan_start(self):
         """Wall-clock start of solver slot 0: the current slot, as the request does."""
         params = self._calculate_time_parameters()
-        anchor = local_midnight(self.time_zone, datetime.now(self.time_zone))
+        anchor = local_midnight(self.time_zone, self._now())
         return anchor + timedelta(seconds=params["current_slot"] * self.time_frame_base)
 
     def _attach_previous_plan(self, optimizer, plan_start):
@@ -853,7 +855,7 @@ class LocalEVOptBackend(EVOptBackend):
             return evopt_request
 
         # Calculate what hour the last forecast slot represents
-        now = datetime.now(self.time_zone)
+        now = self._now()
         total_forecast_seconds = sum(dt)
         forecast_hours = total_forecast_seconds / 3600
         forecast_end_hour = int((now.hour + forecast_hours) % 24)
