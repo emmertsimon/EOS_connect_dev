@@ -18,6 +18,7 @@ import time
 from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
+    one_clock_per_run,
 )
 from .local_evopt.optimizer import (
     BatteryConfig,
@@ -132,6 +133,7 @@ class LocalEVOptBackend(EVOptBackend):
     # Plans the battery's charging curve slot by slot; see optimize().
     plans_charging_curve = True
 
+    @one_clock_per_run
     def optimize(self, eos_request, timeout=180, managed_loads=None,
                  managed_load_budget_w=0.0, charge_power_limit=None):
         """
@@ -639,8 +641,6 @@ class LocalEVOptBackend(EVOptBackend):
         Returns:
             Modified evopt_request with extended time_series arrays
         """
-        from datetime import datetime
-
         ts = evopt_request.get("time_series", {})
         ft = ts.get("ft", [])
         dt = ts.get("dt", [])
@@ -649,7 +649,7 @@ class LocalEVOptBackend(EVOptBackend):
             return evopt_request
 
         # Calculate what hour the last forecast slot represents
-        now = datetime.now(self.time_zone)
+        now = self._now()
         total_forecast_seconds = sum(dt)
         forecast_hours = total_forecast_seconds / 3600
         forecast_end_hour = int((now.hour + forecast_hours) % 24)
