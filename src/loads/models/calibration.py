@@ -139,6 +139,17 @@ HEAT_METER_MIN_ROWS = 3
 # at its configured value and the fit says the slope was not identified.
 COP_FIT_MIN_SPAN_K = 3.0
 
+# What the configured slope is worth in the heat-meter fit, as windows spread evenly
+# over a reference range of air temperatures. The windows pin a slope only as well as
+# their air temperatures spread, and a prior worth a fixed *count* of windows does not
+# know that: four kelvin of autumn (8-12 C, 23 windows) put a live floor-heated house
+# at 0.17 COP/K, twice what its meter had shown, and extrapolated that to 2.6 at 0 C
+# where the meter had read 3.4 a week earlier. Weighed by spread instead, the prior
+# carries a narrow autumn and fades once a winter's range is in the history - at 15 K
+# of spread and a few dozen windows the data has over 90 % of the say.
+COP_SLOPE_PRIOR_WINDOWS = 4.0
+COP_SLOPE_REFERENCE_SPAN_K = 15.0
+
 # How quickly old rows stop counting. A cover left off, or a season turning, should show
 # up within a couple of weeks rather than being averaged away forever.
 WEIGHT_HALF_LIFE_HOURS = 7 * 24.0
@@ -805,9 +816,9 @@ class ThermalCalibrator:
 
         Heat out over electricity in, per running window, regressed on the air
         temperature. The level is a direct measurement and needs no prior; the slope is
-        pulled towards the configured one with the same weight as in the main fit, and
-        held at it outright until the history spans a range of air temperatures - the
-        same rule the main fit applies. Fitted around the mean temperature of the
+        held at the configured one outright until the history spans a range of air
+        temperatures - the same rule the main fit applies - and pulled towards it after
+        that by a weight that falls as the spread grows (`COP_SLOPE_PRIOR_WINDOWS`). Fitted around the mean temperature of the
         windows, so the two do not trade off against each other. On a real house the
         level settled within two days (4.1 at 7 C against 4.0 after a fortnight) while
         the slope needed the first cold spell.
@@ -833,7 +844,14 @@ class ThermalCalibrator:
         if max(temps) - min(temps) >= COP_FIT_MIN_SPAN_K:
             s_tt = sum(weight * (t - mean_t) ** 2 for t, _, weight in pairs)
             s_tc = sum(weight * (t - mean_t) * (cop - mean_cop) for t, cop, weight in pairs)
-            ridge = RIDGE_SAMPLES * (s_tt / len(pairs))
+            # The prior as COP_SLOPE_PRIOR_WINDOWS average windows spread evenly over
+            # the reference range (variance span^2 / 12), so its say shrinks as the
+            # history's own spread grows rather than only as the windows pile up.
+            ridge = (
+                COP_SLOPE_PRIOR_WINDOWS
+                * (total / len(pairs))
+                * COP_SLOPE_REFERENCE_SPAN_K ** 2 / 12.0
+            )
             slope = (s_tc + ridge * prior[1]) / (s_tt + ridge) if s_tt > 0 else prior[1]
         return mean_cop - slope * mean_t, slope
 
