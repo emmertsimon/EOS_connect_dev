@@ -337,3 +337,108 @@ def test_nothing_is_journalled_without_a_store():
 
     clock.at(19, 16)
     assert manager.adopt_schedules({"pool": schedule_for(SLOT_77)}) == 1
+
+
+# --- the planned power is read off the same clock --------------------------------------
+
+def planned_power(manager):
+    return manager.planned_power_now_w(manager.instance("pool"))
+
+
+def test_the_planned_power_is_that_of_the_slot_running_now():
+    """
+    The setpoint a modulating appliance is steered by, read from the last cycle's slot.
+
+    A live heat pump was released for hours on plans of 300 W and more while this read
+    0 W: the plan started in the running slot, and the question was put to the one
+    before it. The automation that turns the figure into a setpoint never saw a power.
+    """
+    clock = Clock()
+    manager = make_manager(clock)
+    manager.run_cycle()                       # context captured at 19:14, slot 76
+
+    clock.at(19, 16)                          # the answer arrives in slot 77
+    manager.adopt_schedules({"pool": schedule_for(SLOT_77)})
+
+    assert released(manager) is True
+    assert planned_power(manager) == pytest.approx(1600.0)   # 400 Wh in a quarter hour
+
+
+def test_a_slot_that_has_ended_plans_no_power():
+    clock = Clock()
+    manager = make_manager(clock)
+    manager.run_cycle()
+
+    clock.at(19, 16)
+    manager.adopt_schedules({"pool": schedule_for(SLOT_76)})
+
+    assert planned_power(manager) == 0.0
+
+
+def test_a_plan_made_partway_through_the_slot_covers_only_the_rest_of_it():
+    """
+    The solver's first step runs from the offer to the slot's end, not a whole slot.
+
+    Offered at 19:20 with ten minutes of the slot left, full power is 267 Wh. Divided
+    by a whole quarter hour that reads 1067 W - a pump told to throttle while the plan
+    has it flat out.
+    """
+    clock = Clock()
+    manager = make_manager(clock)
+    clock.at(19, 20)
+    manager.run_cycle()
+    assert manager.schedulable()              # offered at 19:20
+
+    clock.now = clock.now + timedelta(seconds=8)   # the solve takes a moment
+    series = [0.0] * SLOTS
+    series[SLOT_77] = 1600.0 * 10 / 60
+    manager.adopt_schedules({"pool": series})
+
+    assert planned_power(manager) == pytest.approx(1600.0, abs=0.1)
+
+    clock.at(19, 28)                          # and it stays put for the rest of the slot
+    assert planned_power(manager) == pytest.approx(1600.0, abs=0.1)
+
+
+def test_a_plan_made_in_an_earlier_slot_covers_the_whole_slot():
+    clock = Clock()
+    manager = make_manager(clock)
+    manager.run_cycle()
+    assert manager.schedulable()              # offered at 19:14, in slot 76
+
+    series = [0.0] * SLOTS
+    series[SLOT_77] = 200.0
+    manager.adopt_schedules({"pool": series})
+    clock.at(19, 16)
+
+    assert planned_power(manager) == pytest.approx(800.0)
+
+
+def test_the_planned_power_never_exceeds_the_rating():
+    """Seconds before a slot ends, a second's disagreement doubles the quotient."""
+    clock = Clock()
+    manager = make_manager(clock)
+    clock.now = BASE.replace(hour=19, minute=29, second=50)
+    manager.run_cycle()
+    assert manager.schedulable()
+
+    series = [0.0] * SLOTS
+    series[SLOT_77] = 9.0                     # 3240 W over the ten seconds left
+    manager.adopt_schedules({"pool": series})
+
+    assert planned_power(manager) == pytest.approx(1600.0)
+
+
+def test_this_modules_own_plan_fills_whole_slots():
+    """Only a solver's plan starts mid-slot; the fallback planner's never does."""
+    clock = Clock()
+    manager = make_manager(clock)
+    clock.at(19, 20)
+    manager.run_cycle()
+    item = manager.instance("pool")
+    plan = [0.0] * SLOTS
+    plan[SLOT_77] = 400.0
+    item.last_plan = plan
+
+    assert item.last_plan_from is None
+    assert planned_power(manager) == pytest.approx(1600.0)
