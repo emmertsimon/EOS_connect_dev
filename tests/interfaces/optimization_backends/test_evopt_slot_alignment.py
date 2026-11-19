@@ -207,3 +207,98 @@ def test_a_record_without_an_efficiency_gives_the_solver_none():
     with _at(backend, 6, 0):
         configs = backend._managed_load_configs([record])
     assert configs[0].efficiency is None
+
+
+# -- one clock per run --------------------------------------------------------------------
+#
+# The quarter-aligned run is started so that it *finishes* on the boundary. If the way in
+# and the way out each read the clock, the way in lands in slot n and the way out in
+# n + 1, and everything the run returns comes back one slot late.
+
+
+class _MovingClock:
+    """A clock that has crossed a quarter-hour boundary by the second time it is read."""
+
+    def __init__(self, *moments):
+        self.moments = list(moments)
+
+    def patch(self):
+        moments = self.moments
+
+        class _Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moments.pop(0) if len(moments) > 1 else moments[0]
+
+        return patch(
+            "src.interfaces.optimization_backends.optimization_backend_evopt.datetime",
+            _Clock,
+        )
+
+
+def _straddling_clock():
+    return _MovingClock(
+        datetime(2026, 11, 19, 12, 44, 58, tzinfo=BERLIN),   # slot 50, run starts
+        datetime(2026, 11, 19, 12, 45, 0, tzinfo=BERLIN),    # slot 51, run returns
+    )
+
+
+def test_a_run_that_crosses_a_boundary_shifts_without_one_clock(backend):
+    """The defect itself: two clock readings, one slot apart."""
+    mask = [False] * 192
+    mask[52] = True                   # 13:00
+    with _straddling_clock().patch():
+        window = backend.to_solver_slots(mask, fill=False)
+        back = backend.from_solver_slots(window, fill=False)
+    assert back.index(True) == 53     # one slot late
+
+
+def test_one_clock_per_run_keeps_a_straddling_run_on_its_slot(backend):
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+    )
+
+    mask = [False] * 192
+    mask[52] = True
+
+    @one_clock_per_run
+    def run(self):
+        window = self.to_solver_slots(mask, fill=False)
+        return self.from_solver_slots(window, fill=False)
+
+    with _straddling_clock().patch():
+        back = run(backend)
+    assert back.index(True) == 52
+    assert backend._run_now is None   # released once the run is over
+
+
+def test_the_clock_is_released_when_the_run_fails(backend):
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+    )
+
+    @one_clock_per_run
+    def run(self):
+        raise RuntimeError("solver gone")
+
+    with _at(backend, 12, 44), pytest.raises(RuntimeError):
+        run(backend)
+    assert backend._run_now is None
+
+
+def test_a_nested_run_keeps_the_outer_reading(backend):
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+    )
+
+    @one_clock_per_run
+    def inner(self):
+        return self._calculate_time_parameters()["current_slot"]
+
+    @one_clock_per_run
+    def outer(self):
+        first = self._calculate_time_parameters()["current_slot"]
+        return first, inner(self)
+
+    with _straddling_clock().patch():
+        assert outer(backend) == (50, 50)

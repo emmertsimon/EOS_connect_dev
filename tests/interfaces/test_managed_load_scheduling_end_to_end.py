@@ -247,3 +247,32 @@ def test_a_silent_optimizer_hands_the_load_back_when_it_returns(wired):
     assert manager.adopt_schedules(response["managed_loads"]) == 1
     assert not load.fallback_active
     assert sum(load.last_plan) > 0
+
+
+def test_a_run_finishing_on_the_boundary_keeps_the_hours_it_planned(wired):
+    """
+    The quarter-aligned run is started to finish on the boundary. When the way back
+    read the clock again, everything came back one slot late - the cheap window moved
+    from 10-13 to 11-14 and the slot that had just begun read as unplanned.
+    """
+    manager, interface, prices = wired
+    manager.run_cycle()
+
+    readings = [NOW - timedelta(seconds=2)]   # 05:59:58, the run starts in slot 5
+
+    class _Crossing(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            moment = readings.pop(0) if readings else NOW   # 06:00:00 from then on
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    path = "src.interfaces.optimization_backends.optimization_backend_evopt.datetime"
+    with patch(path, _Crossing):
+        response, _ = interface.optimize(
+            _eos_request(prices), managed_loads=manager.schedulable()
+        )
+    manager.adopt_schedules(response["managed_loads"])
+
+    plan = manager.instance("pool").last_plan
+    assert sum(plan[10:14]) >= 0.6 * sum(plan)
+    assert plan[14] == 0, "the cheap window came back one slot late"
