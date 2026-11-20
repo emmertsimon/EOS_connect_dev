@@ -21,9 +21,9 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 try:  # running from src/ — src/ is on sys.path
-    from timeseries_grid import local_midnight
+    from timeseries_grid import local_midnight, reanchor, slots_between
 except ImportError:  # imported as src.loads (tests)
-    from ..timeseries_grid import local_midnight
+    from ..timeseries_grid import local_midnight, reanchor, slots_between
 
 from .ambient_bias import IMPLAUSIBLE_GAP_K, MAX_OFFSET_K, AmbientBias
 from .contribution import (
@@ -199,6 +199,19 @@ def _padded_efficiency(values, length):
         return None
     series = [float(value) for value in values][:length]
     return series + [1.0] * (length - len(series))
+
+
+def _parse_anchor(value):
+    """A midnight anchor from the optimizer's response, or None when it has none."""
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        logger.debug("[LOADS] unreadable schedule anchor %r - ignoring it", value)
+        return None
 
 
 @dataclass
@@ -444,8 +457,7 @@ class ManagedLoadManager:
                 self.registry.drop(item.id)
                 self.registry.drop(standby_contribution_id(item.id))
                 continue
-            ctx = self._context_for(item, ctx_base)
-            self._last_ctx_for[item.id] = ctx
+            ctx = self._fresh_context(item, ctx_base)
             self._pull_profile(item, ctx)
             if uses_outdoor_ambient(item.type) and not self.has_pv_counter():
                 self._hint_pv_counter(item)
@@ -602,6 +614,9 @@ class ManagedLoadManager:
             )
             records.append({
                 "id": item.id,
+                # The midnight every per-slot field below counts from. The optimizer
+                # re-indexes onto its own when the day has turned in between.
+                "anchor": ctx.anchor.isoformat() if ctx else None,
                 "demand_wh": round(float(demand.total_wh), 1),
                 "max_power_w": float(demand.max_power_w),
                 # A modulating appliance: the least it draws while running, and the
@@ -651,7 +666,7 @@ class ManagedLoadManager:
                 self.registry.drop(item.id)
         return records
 
-    def adopt_schedules(self, schedules, cost=None):
+    def adopt_schedules(self, schedules, cost=None, anchor=None):
         """
         Take the optimizer's placements and settle each gate on them.
 
@@ -666,9 +681,17 @@ class ManagedLoadManager:
         *cost* is what the household pays extra for them, measured by the optimizer
         against a run without them. It is the figure the price limit promises, so it is
         what gets reported rather than the tariff of the hours they happen to occupy.
+
+        *anchor* is the midnight the schedules count from, as the optimizer reports
+        it. Each load's plan is kept on the midnight of its own context, and for the
+        first minutes of a day the two differ: a 00:03 schedule on today's grid read
+        against a 23:59 context named slot 96 as the running one, found nothing there,
+        and dropped the release until the next cycle. The schedule is re-indexed onto
+        the context instead. Without an anchor the two are taken to agree.
         """
         if not isinstance(schedules, dict):
             return 0
+        anchor = _parse_anchor(anchor)
 
         # The optimizer answers far more often than this module polls - every two
         # minutes against a five-minute cycle on a live install - so the context from
@@ -702,6 +725,12 @@ class ManagedLoadManager:
             if ctx is None:
                 continue
             ctx = self._at_now(ctx, now)
+            if anchor is not None:
+                schedule = reanchor(
+                    schedule,
+                    slots_between(anchor, ctx.anchor, self.time_frame_base),
+                    0.0,
+                )
             release = item.adopt_schedule(
                 schedule, ctx, cost=cost, planned_from=offered_at
             )
@@ -722,6 +751,26 @@ class ManagedLoadManager:
             )
             self.refresh(entry_id)
         return adopted
+
+    def _fresh_context(self, item, ctx_base):
+        """
+        *item*'s context for this pass, remembered for the optimizer's answers.
+
+        When the day has turned since the last one, the plan the load is holding is
+        moved onto the new midnight first. A load the optimizer places keeps its
+        schedule across cycles, and that schedule was indexed from yesterday's
+        midnight: read on today's grid it put the running slot a whole day early and
+        released nothing until the next optimizer run.
+        """
+        previous = self._last_ctx_for.get(item.id)
+        ctx = self._context_for(item, ctx_base)
+        if previous is not None:
+            item.reanchor_plan(
+                slots_between(previous.anchor, ctx.anchor, self.time_frame_base),
+                ctx.slot_count,
+            )
+        self._last_ctx_for[item.id] = ctx
+        return ctx
 
     def _at_now(self, ctx, now):
         """
@@ -777,7 +826,7 @@ class ManagedLoadManager:
                 if other.id != item.id:
                     self._consume_budget(budget, other.last_plan)
 
-        ctx = self._context_for(item, ctx_base)
+        ctx = self._fresh_context(item, ctx_base)
         contribution, release = item.evaluate(ctx, budget_wh=budget)
         self._store_result(item, contribution, release)
         self._publish_standby(item, ctx)
