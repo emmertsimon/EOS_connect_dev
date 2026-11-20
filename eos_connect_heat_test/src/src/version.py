@@ -1,1 +1,1 @@
-__version__ = "0.3.42.400-develop+pr368+curve+limit+mod+copair+gatefix+loss+circuit+clock+ppower+copslope.2270de2"
+__version__ = "0.3.42.400-develop+pr368+curve+limit+mod+copair+gatefix+loss+circuit+clock+ppower+copslope+midnight.f7b9000"

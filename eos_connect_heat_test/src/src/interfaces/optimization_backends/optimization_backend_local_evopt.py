@@ -14,12 +14,12 @@ import json
 import logging
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 try:
-    from timeseries_grid import local_midnight
+    from timeseries_grid import local_midnight, reanchor, slots_between
 except ImportError:  # imported as src.interfaces (tests)
-    from ...timeseries_grid import local_midnight
+    from ...timeseries_grid import local_midnight, reanchor, slots_between
 from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
@@ -264,6 +264,10 @@ class LocalEVOptBackend(EVOptBackend):
                 evopt_response, evopt_request, eos_request
             )
             eos_response["managed_loads"] = self._managed_load_schedules(evopt_response)
+            # The midnight the schedules count from. Within a few minutes of the day
+            # turning it can differ from the managed-load module's own, and only the
+            # run knows which one it used - see `_on_run_anchor`.
+            eos_response["managed_loads_anchor"] = self._run_anchor().isoformat()
             eos_response["managed_loads_cost"] = self._managed_load_cost(
                 optimizer, evopt_request, evopt_response, timeout
             )
@@ -645,6 +649,7 @@ class LocalEVOptBackend(EVOptBackend):
         for entry in managed_loads or []:
             if not isinstance(entry, dict):
                 continue
+            entry = self._on_run_anchor(entry)
             try:
                 power = float(entry.get("max_power_w", 0) or 0)
                 demand = float(entry.get("demand_wh", 0) or 0)
@@ -694,6 +699,53 @@ class LocalEVOptBackend(EVOptBackend):
                 len(configs), ", ".join(c.id for c in configs),
             )
         return configs
+
+    def _run_anchor(self):
+        """Local midnight of this run's clock - slot 0 of every EOS array it handles."""
+        return local_midnight(self.time_zone, self._now())
+
+    # Per-slot fields of a managed-load record, with what pads a slot that has none.
+    _RECORD_SLOT_FIELDS = (("feasible", True), ("efficiency", 1.0), ("day_index", -1))
+    _STORE_SLOT_FIELDS = ("loss_w_per_k", "ambient_c", "cop", "gain_wh")
+
+    def _on_run_anchor(self, entry):
+        """
+        *entry* with its per-slot fields counted from this run's midnight.
+
+        The manager builds its records on its own five-minute cycle and stamps them
+        with the midnight that cycle counted from. For the first minutes of a day the
+        two disagree: a record from 23:59 rotated by a 00:03 clock handed the solver
+        yesterday's slots - yesterday's air temperatures, COPs and sun for the house -
+        and the plan came back on today's grid while the manager still read it on
+        yesterday's, so the slot that was running read as unplanned. Re-indexed here,
+        the solver sees the right hours whichever side of midnight the record was made.
+        A record without an anchor is taken as already on this run's grid.
+        """
+        stamp = entry.get("anchor")
+        if not stamp:
+            return entry
+        try:
+            anchor = datetime.fromisoformat(str(stamp))
+        except (TypeError, ValueError):
+            return entry
+        shift = slots_between(anchor, self._run_anchor(), self.time_frame_base)
+        if shift == 0:
+            return entry
+        moved = dict(entry)
+        for key, fill in self._RECORD_SLOT_FIELDS:
+            if moved.get(key):
+                moved[key] = reanchor(moved[key], shift, fill)
+        store = moved.get("store")
+        if isinstance(store, dict):
+            store = dict(store)
+            for key in self._STORE_SLOT_FIELDS:
+                values = store.get(key)
+                if values:
+                    # A physical series is carried on, not zeroed: the last known
+                    # air temperature beats 0 C for the slots the record never had.
+                    store[key] = reanchor(values, shift, values[-1])
+            moved["store"] = store
+        return moved
 
     def _solver_store(self, store):
         """
