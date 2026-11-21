@@ -50,6 +50,7 @@ Supported fields (Local EVopt strategies):
 - ``eos.local_evopt_terminal_soc_value``
 - ``eos.local_evopt_plan_stability_scope``
 - ``eos.local_evopt_plan_stability_weight``
+- ``eos.local_evopt_battery_wear_ct_kwh``
 
 Supported fields (External EVopt):
 - ``eos.external_evopt_terminal_soc_value``
@@ -138,6 +139,7 @@ _LOCAL_EVOPT_FIELD_MAP = {
     "eos.local_evopt_terminal_soc_value": ("terminal_soc_value", str),
     "eos.local_evopt_plan_stability_scope": ("plan_stability_scope", str),
     "eos.local_evopt_plan_stability_weight": ("plan_stability_weight", float),
+    "eos.local_evopt_battery_wear_ct_kwh": ("battery_wear_ct_kwh", float),
 }
 
 # Map of external (HTTP) evopt keys to (backend_attr_name, coerce_fn)
@@ -548,6 +550,8 @@ class HotReloadAdapter:
         # Clamp emergency_reserve_pct to valid range
         if attr == "emergency_reserve_pct":
             coerced = max(0, min(80, coerced))
+        if attr == "battery_wear_ct_kwh":
+            coerced = max(0.0, coerced)
 
         old_val = getattr(backend, attr, "?")
         setattr(backend, attr, coerced)

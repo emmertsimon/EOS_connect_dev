@@ -1021,6 +1021,21 @@ _ALL_FIELDS: list[FieldDef] = [
         hot_reload=True,
     ),
     FieldDef(
+        key="eos.local_evopt_battery_wear_ct_kwh",
+        field_type="float",
+        default=0.0,
+        section="eos",
+        level="expert",
+        description="Battery wear per kWh charged, in ct (0 = off). Grid charging "
+        "then has to beat the round-trip loss plus this before the plan buys "
+        "energy to sell back later",
+        help_url="config-optimizer.html#battery-wear",
+        validation={"min": 0, "max": 30},
+        depends_on={"eos.source": "local_evopt"},
+        display_group="Local Optimizer",
+        hot_reload=True,
+    ),
+    FieldDef(
         key="eos.local_evopt_max_grid_import_w",
         field_type="int",
         default=0,

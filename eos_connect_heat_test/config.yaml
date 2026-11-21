@@ -1,6 +1,6 @@
 name: "EOS connect develop + Heizung (PR 368) + Ladekurve + Ladegrenze + Modulation"
 description: "TEST: aktueller EOS-Connect-develop mit dem Heizungs-PR #368 obendrauf. Wird lokal gebaut. Nicht gleichzeitig mit dem develop- oder stabilen Add-on laufen lassen."
-version: "0.3.42.400-pr368-curve.17"
+version: "0.3.42.400-pr368-curve.18"
 slug: "eos_connect_heat_test"
 url: "https://github.com/ohAnd/EOS_connect/pull/368"
 arch:
