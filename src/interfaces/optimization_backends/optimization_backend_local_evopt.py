@@ -93,6 +93,8 @@ class LocalEVOptBackend(EVOptBackend):
                                   one of TERMINAL_SOC_VALUES.
         max_grid_import_w:        Hard grid import power ceiling in Watts (None = unlimited).
         max_grid_export_w:        Hard grid export power ceiling in Watts (None = unlimited).
+        battery_wear_ct_kwh:      Wear cost per kWh charged into the battery, in ct
+                                  (0 = off). See BatteryConfig.p_wear.
     """
 
     def __init__(
@@ -110,6 +112,7 @@ class LocalEVOptBackend(EVOptBackend):
         plan_stability_weight=plan_stability.DEFAULT_WEIGHT,
         plan_stability_scope=plan_stability.SCOPE_MANAGED_LOADS,
         exact_charging_curve=False,
+        battery_wear_ct_kwh=0.0,
     ):
         # base_url is not used in-process; pass a placeholder so parent __init__ is happy
         super().__init__(
@@ -140,6 +143,8 @@ class LocalEVOptBackend(EVOptBackend):
         # average SOC, instead of iterating per-slot limits around the solver (see
         # _solve_with_exact_curve).
         self.exact_charging_curve = bool(exact_charging_curve)
+        # Hot-reloadable like the strategies; read at every build, never cached.
+        self.battery_wear_ct_kwh = battery_wear_ct_kwh
         self._exact_curve_points = None  # curve points of the run in progress, logged once
         # Initialize rolling average runtime tracking (5-element circular buffer)
         self.last_optimization_runtimes = [0.0] * 5
@@ -502,6 +507,16 @@ class LocalEVOptBackend(EVOptBackend):
         if optimizer.plan_stability_weight > 0:
             optimizer.previous_plan = self.plan_memory.previous(plan_start, optimizer.T)
 
+    def _wear_eur_per_wh(self):
+        """The configured wear cost in EUR/Wh; anything unusable or negative is off."""
+        try:
+            ct_per_kwh = float(self.battery_wear_ct_kwh or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not ct_per_kwh > 0:  # also catches NaN
+            return 0.0
+        return ct_per_kwh / 100.0 / 1000.0
+
     def _build_optimizer(self, evopt_request, timeout, managed_loads=None,
                          managed_load_budget_w=0.0, c_max_series=None, charge_curve=None):
         """Construct the Optimizer object from an EVopt-format request dict."""
@@ -562,6 +577,7 @@ class LocalEVOptBackend(EVOptBackend):
                 s_reserve=s_reserve_wh,
                 c_max_series=c_max_series,
                 charge_curve=charge_curve,
+                p_wear=self._wear_eur_per_wh(),
             ))
 
         ts_data = evopt_request.get("time_series", {})
