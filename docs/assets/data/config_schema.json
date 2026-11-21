@@ -3921,7 +3921,7 @@
       ],
       "help_url": "config-managed-loads.html#managed-loads-calibration",
       "validation": {
-        "min": -0.06,
+        "min": 0.0,
         "max": 0.06
       },
       "depends_on": {

@@ -3080,7 +3080,7 @@ _ALL_FIELDS: list[FieldDef] = [
         ),
         labels=["restart_required"],
         help_url="config-managed-loads.html#managed-loads-calibration",
-        validation={"min": -0.06, "max": 0.06},
+        validation={"min": 0.0, "max": 0.06},
         depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
         display_group="Physical",
     ),

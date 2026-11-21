@@ -88,6 +88,12 @@ LOSS_COEFFICIENT_MAX = 200.0
 
 # A linear COP slope beyond this is a fitting artefact, not a compressor characteristic.
 AIR_COEFFICIENT_LIMIT = 0.06
+# Nor does a heat pump get worse as the air it draws from warms. A falling slope is the
+# windows mixing in something the air did not cause - a hotter tank in the afternoon,
+# a defrost, a tap left running - and planned on, it moves work into the cold hours,
+# exactly the wrong way: a live hot-water tank fitted -0.009 (2.74 at 7 C, 2.58 at
+# 15 C) and would have been heated at night. The floor is flat: no slope at all.
+AIR_COEFFICIENT_MIN = 0.0
 
 # A cover cannot make a store lose heat faster than no cover, and no cover cuts losses
 # by more than this. Both ends are physical, not statistical: outside them the fit has
@@ -360,7 +366,7 @@ class ThermalCalibrator:
         )
         self.configured_cop_nominal = _clamp(float(cop_nominal or 4.0), COP_MIN, COP_MAX)
         self.configured_air_coefficient = _clamp(
-            float(air_coefficient or 0.0), -AIR_COEFFICIENT_LIMIT, AIR_COEFFICIENT_LIMIT
+            float(air_coefficient or 0.0), AIR_COEFFICIENT_MIN, AIR_COEFFICIENT_LIMIT
         )
         self.configured_cover_loss_factor = _clamp(
             float(cover_loss_factor or 1.0), COVER_FACTOR_MIN, 1.0
@@ -792,6 +798,13 @@ class ThermalCalibrator:
             ]
 
         estimate = solve(pinned)
+        if estimate is not None and estimate[1] < 0 and not pinned[1]:
+            # A falling COP slope is not a heat pump (AIR_COEFFICIENT_MIN). Re-solve with
+            # it held flat rather than clipping it afterwards, so the intercept takes
+            # back the level the slope had been carrying instead of losing it.
+            prior_scaled[1] = 0.0
+            pinned[1] = True
+            estimate = solve(pinned) or estimate
         if estimate is None:
             logger.debug("[LOADS] calibration fit is singular - keeping the last estimate")
             return False
@@ -853,6 +866,10 @@ class ThermalCalibrator:
                 * COP_SLOPE_REFERENCE_SPAN_K ** 2 / 12.0
             )
             slope = (s_tc + ridge * prior[1]) / (s_tt + ridge) if s_tt > 0 else prior[1]
+        # Never falling (AIR_COEFFICIENT_MIN). Floored here, before the line is anchored,
+        # so it still passes through the windows' mean: the measured level stays where
+        # the meter put it and only the extrapolation goes flat.
+        slope = max(0.0, slope)
         return mean_cop - slope * mean_t, slope
 
     def _factor_at(self, power_w):
@@ -899,7 +916,7 @@ class ThermalCalibrator:
         )
         air_coefficient = _clamp(
             slope / nominal if nominal > 0 else 0.0,
-            -AIR_COEFFICIENT_LIMIT, AIR_COEFFICIENT_LIMIT,
+            AIR_COEFFICIENT_MIN, AIR_COEFFICIENT_LIMIT,
         )
 
         self.loss_coefficient = loss
@@ -1050,8 +1067,10 @@ class ThermalCalibrator:
             self.solar_gain = float(solar)
         air = state.get("air_coefficient")
         if cop_restorable and isinstance(air, (int, float)):
+            # A falling slope persisted by an older build is floored on the way in; the
+            # history replayed straight after restore refits it properly.
             self.air_coefficient = _clamp(
-                float(air), -AIR_COEFFICIENT_LIMIT, AIR_COEFFICIENT_LIMIT
+                float(air), AIR_COEFFICIENT_MIN, AIR_COEFFICIENT_LIMIT
             )
         self._restored_loss_samples = max(0, int(state.get("loss_samples", 0) or 0))
         self._restored_cop_samples = max(0, int(state.get("cop_samples", 0) or 0))
