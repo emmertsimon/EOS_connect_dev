@@ -162,6 +162,24 @@
 
                     <div data-schema-section="eos" data-schema-anchor="local-evopt"></div>
 
+                    <h3 id="battery-wear">Battery wear</h3>
+                    <p>The optimizer knows the round-trip loss of the battery but not that a cycle
+                        costs the battery part of its life. With a dynamic tariff it therefore buys
+                        whenever the spread beats the loss alone &mdash; for example charging from the
+                        grid at 35&nbsp;ct to cover hours at 38&ndash;41&nbsp;ct later on, a gain of a
+                        few cents for a full cycle's worth of wear.</p>
+                    <p><code>eos.local_evopt_battery_wear_ct_kwh</code> puts a price on every kWh
+                        charged, from the grid or from PV. Grid charging then happens only where the
+                        later price beats the purchase price, the round trip <em>and</em> the wear;
+                        storing solar surplus for the evening still clears it easily, since keeping
+                        a kWh is worth roughly the evening price where exporting it earns the
+                        feed-in tariff. As a starting point divide what the battery cost by the
+                        energy it will put through in its life (capacity &times; cycles &times;
+                        depth): 6000&nbsp;&euro; over 15&nbsp;kWh &times; 6000 cycles &times; 0.9 is
+                        about 7&nbsp;ct; 3&ndash;5&nbsp;ct suits a battery that outlives its
+                        warranty. <code>0</code> (default) switches it off. Unlike plan stability
+                        this is a real cost and is part of what the dashboard reports.</p>
+
                     <h3 id="plan-stability">Plan stability</h3>
                     <p>The optimizer starts from scratch every cycle and does not remember what it
                         decided fifteen minutes ago. Where two plans cost almost the same &mdash; a

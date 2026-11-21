@@ -114,6 +114,7 @@ class OptimizationInterface:
                 exact_charging_curve=bool(
                     config.get("local_evopt_exact_charging_curve", False)
                 ),
+                battery_wear_ct_kwh=config.get("local_evopt_battery_wear_ct_kwh", 0.0),
             )
             self.backend_type = "local_evopt"
             logger.info(

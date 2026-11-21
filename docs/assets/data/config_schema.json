@@ -715,6 +715,25 @@
       "display_group": "Local Optimizer"
     },
     {
+      "key": "eos.local_evopt_battery_wear_ct_kwh",
+      "type": "float",
+      "default": 0.0,
+      "section": "eos",
+      "level": "expert",
+      "description": "Battery wear per kWh charged, in ct (0 = off). Grid charging then has to beat the round-trip loss plus this before the plan buys energy to sell back later",
+      "labels": [],
+      "help_url": "config-optimizer.html#battery-wear",
+      "validation": {
+        "min": 0,
+        "max": 30
+      },
+      "depends_on": {
+        "eos.source": "local_evopt"
+      },
+      "hot_reload": true,
+      "display_group": "Local Optimizer"
+    },
+    {
       "key": "eos.local_evopt_max_grid_import_w",
       "type": "int",
       "default": 0,
