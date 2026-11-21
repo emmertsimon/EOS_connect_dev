@@ -30,7 +30,9 @@ Modifications made for EOS_connect integration (adapted from main branch, ~2025-
 - Added 'emergency_reserve' discharging strategy (end-of-horizon SOC floor)
 - Added 'emergency_reserve' fields (s_reserve) to BatteryConfig and corresponding
   penalty variable/constraint in the MILP model
-- Added gapRel to OptimizerSettings and the CBC invocation (1% optimality gap)
+- Added gapRel to OptimizerSettings and the CBC invocation (1% optimality gap; the
+  terminal battery and store terms are measured from their start values so the gap
+  is not inflated by a constant, and charging-curve rounds solve to a tighter gap)
 - Solver resolution probes CBC candidates with a real execve() and prefers the
   first that runs (system PATH, then pulp's bundled binary), because pulp's
   bundled x86_64 CBC is glibc-linked and cannot exec on Alpine/musl
@@ -175,6 +177,7 @@ def _resolve_cbc_solver(
     num_threads: Optional[int] = None,
     time_limit: Optional[float] = None,
     gapRel: Optional[float] = None,
+    gapAbs: Optional[float] = None,
 ) -> pulp.LpSolver:
     """
     Return a configured PuLP CBC solver bound to a verified-runnable binary.
@@ -189,6 +192,7 @@ def _resolve_cbc_solver(
         threads=num_threads,
         timeLimit=time_limit,
         gapRel=gapRel,
+        gapAbs=gapAbs,
     )
 
 
@@ -197,8 +201,12 @@ class OptimizerSettings:
     """Solver settings (replaces pydantic-based settings from upstream)."""
     num_threads: Optional[int] = None
     time_limit: Optional[float] = None
-    # 1% optimality gap — negligible for energy, significantly faster
+    # 1% optimality gap for the main solve - relative to the whole objective, which
+    # is why the terminal battery and store terms are measured from their start
+    # values (a constant there is pure slack). The charging-curve rounds use a much
+    # tighter one of their own, see `CURVE_REFINE_GAP_REL`.
     gapRel: Optional[float] = 0.01
+    gapAbs: Optional[float] = None
 
 
 @dataclass
@@ -855,9 +863,11 @@ class Optimizer:
             if starts is not None:
                 objective -= load.start_cost_eur * pulp.lpSum(starts)
 
-        # Final state of charge value [currency unit]
+        # Final state of charge value [currency unit], as the change from the start for
+        # the same reason as the store's (see `_store_objective`): a constant in the
+        # objective is slack in CBC's relative stopping gap.
         for i, bat in enumerate(self.batteries):
-            objective += self.variables['s'][i][-1] * bat.p_a
+            objective += (self.variables['s'][i][-1] - bat.s_initial) * bat.p_a
 
         # Battery wear [currency unit], on every Wh charged whatever its source. On the
         # charge side because that is where a cycle is decided: grid charging now has
@@ -1458,7 +1468,12 @@ class Optimizer:
         terminal, penalty = self._store_values(load)
         lows = self.variables['tm_lo'][i]
         highs = self.variables['tm_hi'][i]
-        term = terminal * self.variables['tm_end'][i]
+        # Credited from where the store starts, not from 0 C. The same optimum - the
+        # two differ by a constant - but CBC's stopping gap is relative to the whole
+        # objective, and a house credited for every kelvin above freezing adds ~43 EUR
+        # of constant to it: 1 % of that let a live plan leave 9 kWh in the battery
+        # while buying the evening at 42-45 ct, because that cost less than the slack.
+        term = terminal * (self.variables['tm_end'][i] - float(load.store.t_initial))
         term -= pulp.lpSum(
             penalty * self.time_series.dt[t] / 3600.0 * (lows[t] + highs[t])
             for t in self.time_steps
@@ -1736,10 +1751,16 @@ class Optimizer:
         than a second full branch and bound. Their energy stays free within the held
         blocks, and so does everything the battery and the grid do.
 
-        The rounds share a time budget. A round that runs out of it keeps the best
-        plan the solver found by then - that one obeys the curve too. If it found
-        none, the plan of the round before stands, and the log names the slots in
-        which it may count on more than the curve allows.
+        The rounds share a time budget. A round counts only if the solver finished it;
+        one that runs out of time is discarded, even with a plan in hand, and the plan
+        of the round before stands, while the log names the slots in which it may
+        count on more than the curve allows. Keeping the best plan found by then
+        looked safe - it obeys the curve too - and was not: CBC reports a time-out
+        with an incumbent as "Optimal" (sol_status IntegerFeasible), and on a live
+        HA host that incumbent held a full battery through an evening at 42-45 ct and
+        bought the house's power instead, where the envelope plan emptied it. A few
+        hundred watts too much near full is a small error; a battery left unused is
+        not.
         """
         budget = max(self.CURVE_REFINE_BUDGET_MIN_S,
                      self.CURVE_REFINE_BUDGET_FACTOR * first_solve_s)
@@ -1747,6 +1768,9 @@ class Optimizer:
             budget = min(budget, float(self.settings.time_limit))
         deadline = time.monotonic() + budget
         own_limit = solver.timeLimit
+        own_gaps = {key: solver.optionsDict.get(key) for key in ('gapRel', 'gapAbs')}
+        solver.optionsDict['gapRel'] = self.CURVE_REFINE_GAP_REL
+        solver.optionsDict['gapAbs'] = self.CURVE_REFINE_GAP_ABS
         switches = {
             var.name: round(pulp.value(var) or 0.0)
             for var in self._managed_load_switches()
@@ -1776,12 +1800,21 @@ class Optimizer:
                         var.lowBound = var.upBound = switches[var.name]
                 solver.timeLimit = remaining if own_limit is None else min(own_limit, remaining)
                 self.problem.solve(solver)
-                if pulp.LpStatus[self.problem.status] != 'Optimal':
+                if (
+                    pulp.LpStatus[self.problem.status] != 'Optimal'
+                    or self.problem.sol_status != pulp.LpSolutionOptimal
+                ):
+                    # Not finished: stopped on time, with or without an incumbent.
                     self.problem, self.variables, self._curve_exact_slots = previous
                     self._warn_curve_not_refined(beyond, budget)
                     return
         finally:
             solver.timeLimit = own_limit
+            for key, value in own_gaps.items():
+                if value is None:
+                    solver.optionsDict.pop(key, None)
+                else:
+                    solver.optionsDict[key] = value
 
     def _managed_load_switches(self):
         """The managed loads' on/off and start binaries of the current model."""
@@ -1808,6 +1841,14 @@ class Optimizer:
     # one that arrives a minute late.
     CURVE_REFINE_BUDGET_FACTOR = 4.0
     CURVE_REFINE_BUDGET_MIN_S = 5.0
+    # Stopping gap of those rounds. Each round is a new branch and bound whose plan is
+    # kept as found, so the main solve's 1 % compounds from round to round: on a live
+    # day four rounds lost 3 ct each and the plan ended up holding a full battery
+    # through a 42-45 ct evening, where the envelope plan - which already obeyed the
+    # curve - emptied it. With the managed loads held, a round is about as quick as a
+    # plan without them, so it can afford to be close to exact.
+    CURVE_REFINE_GAP_REL = 0.0005
+    CURVE_REFINE_GAP_ABS = 0.005
 
     def solve(self) -> Dict:
         """
@@ -1822,6 +1863,7 @@ class Optimizer:
             num_threads=self.settings.num_threads,
             time_limit=self.settings.time_limit,
             gapRel=self.settings.gapRel,
+            gapAbs=self.settings.gapAbs,
         )
 
         with TemporaryDirectory() as tmpdir:
