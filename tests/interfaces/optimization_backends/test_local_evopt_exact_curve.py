@@ -185,6 +185,34 @@ def test_a_round_the_solver_cannot_finish_falls_back_to_the_round_before(monkeyp
     assert "no exact plan within" in caplog.text
 
 
+def test_a_round_stopped_on_time_with_a_plan_also_falls_back(monkeypatch, caplog):
+    """
+    CBC reports a time-out with an incumbent as "Optimal" - only sol_status tells it
+    from a finished solve. Such a plan is not kept: on a live host it held a full
+    battery through a dear evening where the envelope plan emptied it.
+    """
+    envelope_charge, envelope_soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=False)
+    real_solve = pulp.LpProblem.solve
+    calls = []
+
+    def solve_then_stop_on_time(self, solver=None, **kwargs):
+        calls.append(solver.timeLimit)
+        result = real_solve(self, solver, **kwargs)
+        if len(calls) > 1:
+            # What PuLP makes of "Stopped on time - objective value ...".
+            self.status = pulp.LpStatusOptimal
+            self.sol_status = pulp.LpSolutionIntegerFeasible
+        return result
+
+    monkeypatch.setattr(pulp.LpProblem, "solve", solve_then_stop_on_time)
+    with caplog.at_level(logging.WARNING):
+        charge, soc = _solve(CONVEX, s_initial=9000.0, sun_slots=2, exact=True)
+    assert len(calls) == 2
+    assert soc == pytest.approx(envelope_soc, abs=1e-3)
+    assert charge == pytest.approx(envelope_charge, abs=1e-3)
+    assert "no exact plan within" in caplog.text
+
+
 def test_the_exact_round_holds_the_managed_loads_where_the_first_solve_put_them(monkeypatch):
     """
     A heat pump's runtime blocks are what make a solve slow; the exact round keeps
