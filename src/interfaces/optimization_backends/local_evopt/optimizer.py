@@ -239,6 +239,10 @@ class BatteryConfig:
     c_max_series: Optional[List[float]] = None
     # SOC-dependent charge limit (EOS_connect extension), see ChargeCurveConfig.
     charge_curve: Optional["ChargeCurveConfig"] = None
+    # Wear per Wh charged, in currency/Wh (EOS_connect extension). Every Wh that goes in
+    # comes out again and costs the battery a little of its life; without a price on
+    # that the model buys at 35 ct to sell back at 38, a cycle for a few cents. 0 = off.
+    p_wear: float = 0.0
 
     def __post_init__(self):
         if self.s_capacity is None:
@@ -854,6 +858,14 @@ class Optimizer:
         # Final state of charge value [currency unit]
         for i, bat in enumerate(self.batteries):
             objective += self.variables['s'][i][-1] * bat.p_a
+
+        # Battery wear [currency unit], on every Wh charged whatever its source. On the
+        # charge side because that is where a cycle is decided: grid charging now has
+        # to beat the round trip *and* the wear, and storing PV for a dear evening
+        # still clears it easily (0.92 x 35 ct - 4 ct is far above 8 ct export).
+        for i, bat in enumerate(self.batteries):
+            if bat.p_wear > 0:
+                objective -= bat.p_wear * pulp.lpSum(self.variables['c'][i])
 
         # Demand rate charge
         if self.is_grid_demand_rate_active:
@@ -1945,6 +1957,11 @@ class Optimizer:
                 (pulp.value(self.variables['s'][i][self.T - 1]) or 0.0)
                 - bat.s_initial
             ) * bat.p_a
+            # Wear is a real cost of the plan, not a strategy nudge, so it is reported.
+            if bat.p_wear > 0:
+                clean_objective -= bat.p_wear * sum(
+                    pulp.value(var) or 0.0 for var in self.variables['c'][i]
+                )
         if self.is_grid_demand_rate_active:
             clean_objective += -self.grid.prc_p_exc_imp * (
                 pulp.value(self.variables['p_max_imp_exc']) or 0.0
