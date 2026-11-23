@@ -3377,7 +3377,8 @@ _ALL_FIELDS: list[FieldDef] = [
             "(0 = no limit). With the built-in optimizer the load is scheduled against "
             "this figure directly, so it runs whenever the energy actually costs less; "
             "with an external optimizer it is a simpler rule that skips any hour above "
-            "it. Ignored when frost protection is active"
+            "it. Ignored when frost protection is active and for the charge a soft limit "
+            "calls for"
         ),
         hot_reload=True,
         help_url="config-managed-loads.html#managed-loads-price-limit",
@@ -3408,12 +3409,46 @@ _ALL_FIELDS: list[FieldDef] = [
         section="managed_loads",
         level="standard",
         description=(
-            "Run immediately regardless of price when the medium falls to this "
-            "temperature"
+            "Hard limit: run immediately regardless of price, window and season when "
+            "the medium falls to this temperature"
         ),
         hot_reload=True,
         help_url="config-managed-loads.html#managed-loads-operation",
-        validation={"min": -20, "max": 40},
+        validation={"min": -20, "max": 60},
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Operation",
+    ),
+    FieldDef(
+        key="managed_loads.soft_limit_temp_c",
+        field_type="float",
+        default=0,
+        section="managed_loads",
+        level="standard",
+        description=(
+            "Soft limit (0 = off): below this temperature one charge back to target is "
+            "planned in the next allowed window whatever the price limit says - in its "
+            "cheapest slots. A hot water tank at 42 C on a dear day, for instance"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-operation",
+        validation={"min": 0, "max": 90},
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Operation",
+    ),
+    FieldDef(
+        key="managed_loads.soft_limit_hours",
+        field_type="float",
+        default=0,
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Hours from now within which a soft-limit charge has to be done (0 = by the "
+            "end of the next allowed window). Never shorter than the charge itself "
+            "from the window's start"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-operation",
+        validation={"min": 0, "max": 48},
         depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
         display_group="Operation",
     ),
