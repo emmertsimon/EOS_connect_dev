@@ -433,6 +433,12 @@ class ManagedLoadConfig:
         min_runtime_slots: Shortest run the appliance may be started for. Above 1 this
             costs a binary per slot.
         urgent_wh: Energy that must be placed whatever it costs - frost protection.
+            A floor priced far above any tariff rather than a hard one, so a window or
+            an on/off run that cannot hold it costs a shortfall, not the whole plan.
+        must_wh: The same, counted only in ``must_slots``: the charge a store's soft
+            or hard limit calls for, due within its next window or right away. Takes
+            the place of ``urgent_wh`` where it is set.
+        must_slots: Per-slot mask of where ``must_wh`` counts; None for everywhere.
         committed_on_slots: Leading slots the appliance is already running through and
             may not be stopped in - the remainder of a minimum run begun under an
             earlier plan. Every plan is built from scratch, so without this the seam
@@ -457,6 +463,8 @@ class ManagedLoadConfig:
     max_power_w: float = 0.0
     min_runtime_slots: int = 1
     urgent_wh: float = 0.0
+    must_wh: float = 0.0
+    must_slots: Optional[List[bool]] = None
     start_cost_eur: float = 0.0
     # Cap on slots this load may run in one calendar day, 0 for none, with a label per
     # slot saying which day it belongs to. A label rather than a boundary because it
@@ -494,6 +502,16 @@ class ManagedLoadConfig:
             value = max(0.0, float(self.power_w[t]))
             return min(value, self.max_power_w) if self.max_power_w > 0 else value
         return self.max_power_w
+
+    def floor_wh(self):
+        """The energy that must be placed whatever it costs, and the slots it counts in."""
+        if self.store is not None:
+            return 0.0, None
+        if self.must_wh > 0:
+            return min(self.must_wh, max(0.0, self.demand_wh)), self.must_slots
+        if self.urgent_wh > 0:
+            return min(self.urgent_wh, max(0.0, self.demand_wh)), None
+        return 0.0, None
 
     def efficiency_at(self, t):
         """The efficiency of slot *t*, 1.0 where none was given."""
@@ -847,6 +865,16 @@ class Optimizer:
             else:
                 self.variables['ml_on'][i] = None
 
+        # A load whose limits call for a charge: how much of it the plan falls short
+        # of. Priced in the objective rather than forbidden, so a window or an on/off
+        # run that cannot hold the charge never makes the model infeasible.
+        self.variables['ml_short'] = {}
+        for i, load in enumerate(self.managed_loads):
+            floor, _ = load.floor_wh()
+            self.variables['ml_short'][i] = (
+                self._new_var(f"ml_short_{i}", lowBound=0) if floor > 0 else None
+            )
+
         # Heated stores planned by temperature: the temperature after each slot, and
         # how far it strays below the comfort floor or above the storage ceiling.
         self.variables['tm'] = {}
@@ -921,6 +949,9 @@ class Optimizer:
             starts = self.variables['ml_start'][i]
             if starts is not None:
                 objective -= load.start_cost_eur * pulp.lpSum(starts)
+            short = self.variables['ml_short'].get(i)
+            if short is not None:
+                objective -= self._shortfall_price(load) * short
 
         # Final state of charge value [currency unit], as the change from the start for
         # the same reason as the store's (see `_store_objective`): a constant in the
@@ -1440,10 +1471,17 @@ class Optimizer:
                 delivered = self._delivered(i, load)
                 self.problem += delivered <= max(0.0, load.demand_wh)
 
-                # Frost protection and the like: energy that must be placed whatever
-                # it costs, so it is a floor the value term cannot argue with.
-                if load.urgent_wh > 0:
-                    self.problem += delivered >= min(load.urgent_wh, load.demand_wh)
+                # Frost protection, a soft or hard limit: energy that must be placed
+                # whatever it costs - in its own slots where it names them. A floor
+                # the value term cannot argue with, but a priced one: on 25.10. a
+                # hard floor of a whole horizon's demand, against a 10-16 window,
+                # made every solve infeasible.
+                floor, slots = load.floor_wh()
+                short = self.variables['ml_short'].get(i)
+                if floor > 0 and short is not None:
+                    self.problem += (
+                        self._delivered(i, load, slots) + short >= floor
+                    )
 
             feasible = load.feasible or [True] * self.T
             self._add_daily_cap_constraints(load, run, feasible)
@@ -1575,12 +1613,28 @@ class Optimizer:
         # What is credited at the end: the final temperature, but no more than target.
         self.problem += self.variables['tm_end'][i] <= temps[-1]
 
-    def _delivered(self, i, load):
-        """A load's placed energy in units of its best slot."""
+    def _delivered(self, i, load, slots=None):
+        """A load's placed energy in units of its best slot, in *slots* if given."""
         run = self.variables['ml'][i]
+        steps = [
+            t for t in self.time_steps
+            if slots is None or (t < len(slots) and slots[t])
+        ]
         if not load.efficiency:
-            return pulp.lpSum(run)
-        return pulp.lpSum(load.efficiency_at(t) * run[t] for t in self.time_steps)
+            return pulp.lpSum(run[t] for t in steps)
+        return pulp.lpSum(load.efficiency_at(t) * run[t] for t in steps)
+
+    def _shortfall_price(self, load):
+        """
+        What a Wh of a must-charge left unplaced costs the plan.
+
+        Ten times the dearest import price ahead, and never below ten times what the
+        load's energy is worth: far enough above every tariff that the charge is placed
+        whenever it fits, in the cheapest slots it may use, and finite so a charge that
+        cannot fit degrades to a short plan.
+        """
+        dearest = max([float(p) for p in (self.time_series.p_N or [])] + [0.0])
+        return max(10.0 * dearest, 10.0 * float(load.value_eur_per_wh or 0.0), 1e-3)
 
     def _add_shared_budget_constraints(self):
         """

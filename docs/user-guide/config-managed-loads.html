@@ -407,8 +407,14 @@
                             moved.</li>
                         <li><strong>Minimum ambient temperature</strong> &mdash; an air source heat pump
                             barely works in the cold and its heat exchanger can freeze.</li>
-                        <li><strong>Frost protection</strong> &mdash; below this the appliance runs
-                            immediately and price stops mattering.</li>
+                        <li><strong>Frost protection</strong> (hard limit) &mdash; below this the appliance
+                            runs immediately and price, window and season stop mattering.</li>
+                        <li><strong>Soft limit</strong> &mdash; below this one charge back to target is
+                            planned in the next allowed window whatever the <em>Max Price</em> says, in its
+                            cheapest slots. A hot water tank whose price limit keeps it cold on a dear day
+                            still gets its midday charge; above the soft limit the price limit rules as
+                            before. <em>Soft limit hours</em> can pull the deadline in from the end of the
+                            window.</li>
                         <li><strong>Strategy</strong> &mdash; <em>Combined</em> uses the grid price but
                             values your own PV surplus at the feed-in tariff, so free solar beats cheap
                             grid energy.</li>

@@ -16,6 +16,7 @@ entirely when the water is about to freeze.
 """
 
 import logging
+from dataclasses import replace
 
 from .efficiency import effective_wh
 
@@ -268,7 +269,86 @@ def plan_contingent(demand, ctx, options, budget_wh=None):
     None means unlimited. Slots are filled to at most the load's own power draw and at
     most that residual, which is what stops a pool pump and a sauna from stacking into
     the same cheap slot and forecasting a peak the house cannot draw.
+
+    A charge a soft or hard limit calls for (``demand.must_wh``) is placed first, in
+    its own slots and past the price cap; the rest of the demand follows the usual
+    rules around it.
     """
+    if getattr(demand, "must_wh", 0.0) > 0 and getattr(demand, "must_slots", None):
+        return _plan_with_must(demand, ctx, options, budget_wh)
+    return _plan_contingent(demand, ctx, options, budget_wh)
+
+
+def _plan_with_must(demand, ctx, options, budget_wh):
+    """The must-charge first, then whatever else is wanted, in what is left."""
+    length = ctx.slot_count
+    hours = ctx.hours_per_slot()
+    caps = []
+    for index in range(length):
+        cap = demand.power_at(index) * hours
+        if budget_wh is not None:
+            cap = min(cap, max(0.0, budget_wh[index]))
+        caps.append(cap)
+
+    must_reasons = [SLOT_NOT_NEEDED] * length
+    must_plan = [0.0] * length
+    start = max(0, ctx.current_slot)
+    feasible = _series([bool(v) for v in demand.feasible], length, True)
+    mask = _series([bool(v) for v in demand.must_slots], length, False)
+    costs = _slot_costs(ctx, options, caps, demand.efficiency)
+    candidates = [
+        index for index in range(start, length)
+        if mask[index] and feasible[index] and caps[index] > 0
+        and not (isinstance(costs[index], float) and costs[index] == float("inf"))
+    ]
+    if candidates:
+        if demand.urgent:
+            order = sorted(candidates)
+        else:
+            blocks = _blocks(candidates, options.min_runtime_slots) or [
+                [index] for index in candidates
+            ]
+            blocks.sort(key=lambda run: (_block_cost(run, costs), run[0]))
+            order, seen = [], set()
+            for run in blocks:
+                for slot in run:
+                    if slot not in seen:
+                        seen.add(slot)
+                        order.append(slot)
+        must_plan = _fill(
+            must_plan, order, caps, min(float(demand.must_wh), float(demand.total_wh)),
+            options, ctx, must_reasons, demand.efficiency,
+        )
+    placed = sum(
+        must_plan[index] * _efficiency_at(demand.efficiency, index)
+        for index in range(length)
+    )
+
+    # The rest of the demand, in whatever the must-charge left of each slot.
+    rest_budget = [
+        max(0.0, caps[index] - must_plan[index]) if must_plan[index] > 0
+        else (budget_wh[index] if budget_wh is not None else float("inf"))
+        for index in range(length)
+    ]
+    rest = replace(
+        demand, total_wh=max(0.0, float(demand.total_wh) - placed),
+        must_wh=0.0, must_slots=[],
+    )
+    rest_plan = _plan_contingent(rest, ctx, options, rest_budget)
+
+    plan = [must_plan[index] + rest_plan[index] for index in range(length)]
+    reasons = list(rest.slot_reasons or [SLOT_NOT_NEEDED] * length)
+    for index in range(length):
+        if must_plan[index] > 0:
+            reasons[index] = SLOT_PLANNED
+    demand.slot_reasons = reasons
+    drawn = _raw_slot_costs(ctx, options, caps) if demand.efficiency else costs
+    demand.plan_price_eur_per_wh = plan_price(plan, _numeric_costs(drawn, options))
+    return plan
+
+
+def _plan_contingent(demand, ctx, options, budget_wh=None):
+    """`plan_contingent` without a must-charge."""
     length = ctx.slot_count
     plan = [0.0] * length
     # Filled in as slots are ruled out, so the page can name the setting that is
