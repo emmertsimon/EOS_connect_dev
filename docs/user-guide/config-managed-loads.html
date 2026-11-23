@@ -565,34 +565,76 @@
                         immediately.</p>
 
                     <h3 id="managed-loads-modulation">A heat pump that modulates</h3>
-                    <p>An inverter heat pump does not run at one power: it draws anything between its
-                        minimum and its maximum, and it does not deliver the same heat per watt across
-                        that range. At low modulation the lift is small and the COP at its best; at full
-                        power the flow runs hotter and every extra watt buys less heat. Planned at a single
-                        <code>rated_power_w</code>, a store is either filled too slowly on paper (the
-                        pump really ran at 2&nbsp;kW) or too quickly (it really idled along at 400&nbsp;W),
-                        and the battery and grid plan around it are off by the difference.</p>
-                    <p>Set <code>min_power_w</code> to the least the pump draws while running and
-                        <code>rated_power_w</code> to the most. The built-in optimizer then picks a power in
-                        between for every slot it runs. <code>modulation_cop</code> describes how the
-                        efficiency changes with it, as <code>W:factor</code> points on the COP the model
-                        already works out from the air temperature &mdash; for example
-                        <code>400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74</code>. Measured
-                        values are best: the heat counter of the pump (EMS-ESP, Modbus) against its
-                        electrical power over a few runs at different powers. Without it every watt counts
-                        the same, and the plan will happily put a whole night's heat into the cheapest hour
-                        at full power.</p>
-                    <p>With a <a href="#managed-loads-cop"><code>heat_sensor</code></a> as well, every
-                        reading is divided by the factor at the power it was taken at before it enters the
-                        COP fit. The level the model learns is then the COP at factor 1.0, and a cold week
-                        of full-power runs does not lower it on top of the curve that already accounts
-                        for them.</p>
-                    <p>The plan's power for the slot that is running is published as
-                        <strong>Planned Power</strong> (<code>managed_load/&lt;id&gt;/planned_power_w</code>).
-                        A heat pump rarely takes a power setpoint directly; an automation turns it into
-                        what the pump does take &mdash; a room or flow setpoint offset, a power limit, an
-                        SG-Ready level. The pump keeps its own control, so the match is approximate; the next
-                        plan starts from the temperature the house really reached.</p>
+                    <p>An inverter heat pump does not run at one power, and the power is not the
+                        plan&rsquo;s to choose: its own controller picks the compressor speed from the
+                        weather-compensation curve and from how far the water and the rooms still have
+                        to go. A release signal only decides <em>whether</em> it runs. Measured on a
+                        Bosch CS6800iAW over 35 heating runs: at &minus;1&nbsp;&deg;C outside with the
+                        house at 21.0&nbsp;&deg;C it ran flat out at 2.2&nbsp;kW; three hours later, at
+                        &minus;3&nbsp;&deg;C but with the house at 21.4&nbsp;&deg;C, it had settled to
+                        650&nbsp;W by itself; at 8&ndash;12&nbsp;&deg;C it never drew more than
+                        650&nbsp;W. Planned at one <code>rated_power_w</code> &mdash; or at a power of the
+                        optimizer&rsquo;s choosing &mdash; the heat, the battery and the grid plan are all off
+                        by the difference.</p>
+                    <p>So a modulating heat pump is planned <strong>on or off</strong>, and while it is
+                        on it is counted at what it will really draw in that slot, from a
+                        <strong>Power Curve</strong>:</p>
+                    <p><code>P = base + air &times; T_air + store &times; (T_store &minus; ref)</code>, held
+                        between <code>min_power_w</code> and <code>rated_power_w</code>.</p>
+                    <p><code>T_air</code> is the air the COP is worked out from (outdoors for an
+                        air-source pump), <code>T_store</code> the temperature of what it heats at the start
+                        of the slot. For the house above: <code>base:1810, air:-109, store:-880,
+                            ref:21</code> &mdash; 1810&nbsp;W at 0&nbsp;&deg;C outside with the rooms at
+                        21&nbsp;&deg;C, 109&nbsp;W more per kelvin colder outside, 880&nbsp;W less per kelvin
+                        warmer inside. Planned by temperature, the built-in optimizer works each
+                        slot&rsquo;s power out from the temperature it plans for that slot and solves again
+                        until the two agree, so a run starts flat out and tails off as the house warms,
+                        as the real one does.</p>
+                    <div class="scroll-x">
+                        <table>
+                            <thead><tr><th>Setting</th><th>What it is</th></tr></thead>
+                            <tbody>
+                                <tr><td><code>min_power_w</code></td><td>The least it draws while running.
+                                    Set, it makes the appliance modulating: planned on/off at the curve&rsquo;s
+                                    power.</td></tr>
+                                <tr><td><code>rated_power_w</code></td><td>The most it draws &mdash; the
+                                    power it reaches flat out, from the meter, not the nameplate.</td></tr>
+                                <tr><td><code>power_curve</code></td><td>The starting curve. Empty: start at
+                                    the rated power everywhere and learn.</td></tr>
+                                <tr><td><code>power_curve_learning</code></td><td>On (default): the runs of
+                                    the last two weeks refine the curve.</td></tr>
+                                <tr><td><code>modulation_cop</code></td><td>How the COP changes with the
+                                    power, as <code>W:factor</code> points.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p><strong>Learning.</strong> With a <code>power_sensor</code>, every running sample
+                        &mdash; metered power, air and store temperature, recorded each cycle anyway &mdash;
+                        enters a robust fit once the compressor has had ten minutes to settle. The
+                        configured curve counts as a dozen measurements spread across a heating season, so
+                        a fresh install follows it, a week across a wide range of weather replaces it, and a
+                        week of mild days moves the mild end only. A reading at the rated power while the
+                        curve already asks for more says only &ldquo;flat out&rdquo; and is not taken for a
+                        point on the line. The card and the API show the curve in force, where it came
+                        from, the samples and the fit&rsquo;s error. On the house above, two weeks of runs
+                        from a flat start came to <code>base:1671, air:-102, store:-523</code>,
+                        &plusmn;400&nbsp;W per sample &mdash; the pump&rsquo;s own minute-to-minute wander.</p>
+                    <p><strong>The COP across the range.</strong> <code>modulation_cop</code> describes how
+                        the efficiency changes with the power, as <code>W:factor</code> points on the COP the
+                        model already works out from the air temperature &mdash; for example
+                        <code>400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74</code>. Each slot&rsquo;s COP is
+                        scaled by the factor at the power the curve gives it. With a
+                        <a href="#managed-loads-cop"><code>heat_sensor</code></a> as well, every reading is
+                        divided by the factor at the power it was taken at before it enters the COP fit, so
+                        the level the model learns is the COP at factor 1.0.</p>
+                    <p><strong>Leave the pump its setpoint.</strong> The curve describes the pump under the
+                        setpoint it had while the curve was measured. An automation that raises the room or
+                        flow setpoint when the plan wants more makes it draw more than the curve says
+                        &mdash; on the house above about 500&nbsp;W per kelvin of room setpoint &mdash; and the
+                        plan is off again. Keep the setpoint the pump runs at while released fixed, and let
+                        the release decide. The power of the slot that is running is still published as
+                        <strong>Planned Power</strong> (<code>managed_load/&lt;id&gt;/planned_power_w</code>),
+                        for display.</p>
 
                     <h3 id="managed-loads-exclusive">One machine, two loads</h3>
                     <p>A heat pump that heats the house and makes hot water is one compressor: at

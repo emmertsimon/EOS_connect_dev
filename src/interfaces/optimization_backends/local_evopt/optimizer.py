@@ -52,7 +52,7 @@ import logging
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -354,6 +354,52 @@ class ChargeCurveConfig:
 
 
 @dataclass
+class PowerCurveConfig:
+    """
+    What a load draws while running, from the temperature of what it heats
+    (EOS_connect extension).
+
+    A modulating heat pump's power is its controller's choice: the plan can switch it,
+    not set it. Measured, the draw follows the air and the store - more power when it
+    is cold outside, less when the house is already warm - and the load's model hands
+    that over as a formula, so a plan that follows the store can work the power out
+    from the temperature it plans rather than from a guess::
+
+        P[t] = clamp(base_w[t] + store_w_per_k * (T_start[t] - ref_c), min_w, max_w)
+
+    ``base_w`` already holds the air's share for each slot. ``T_start`` is the store's
+    temperature at the start of the slot. ``cop_factor`` is the modulation curve -
+    the COP at that power as a factor on the store's per-slot COP - tabulated as
+    ``[(power_w, factor), ...]`` and interpolated linearly; empty is 1.0 throughout.
+    Lists are in solver slot space. See Optimizer._refine_power_curves.
+    """
+
+    base_w: List[float]
+    store_w_per_k: float = 0.0
+    ref_c: float = 20.0
+    min_w: float = 0.0
+    max_w: float = 0.0
+    cop_factor: List[Tuple[float, float]] = field(default_factory=list)
+
+    def power(self, t, store_c):
+        """The draw in slot *t* with the store at *store_c* when the slot starts."""
+        if not self.base_w:
+            return self.max_w
+        base = self.base_w[t] if t < len(self.base_w) else self.base_w[-1]
+        value = float(base) + self.store_w_per_k * (float(store_c) - self.ref_c)
+        high = self.max_w if self.max_w > 0 else value
+        return min(high, max(self.min_w, value))
+
+    def factor(self, power_w):
+        """The modulation COP factor at *power_w*: 1.0 without a table."""
+        if not self.cop_factor:
+            return 1.0
+        powers = [float(p) for p, _ in self.cop_factor]
+        factors = [float(f) for _, f in self.cop_factor]
+        return float(np.interp(float(power_w), powers, factors))
+
+
+@dataclass
 class ManagedLoadConfig:
     """
     A load whose *timing* is the optimizer's to choose (EOS_connect extension).
@@ -434,12 +480,20 @@ class ManagedLoadConfig:
     # demand, its value and the efficiency are then unused: the store's band and what
     # heat is worth at the end of the horizon take their place.
     store: Optional[ThermalStoreConfig] = None
-    # A modulating appliance (EOS_connect extension): while running it draws anything
-    # from min_power_w to max_power_w; 0 means exactly max_power_w. heat_lines, for a
-    # store, is the heat per Wh across that range as ``[(slope, intercept_w), ...]``
-    # on top of the store's per-slot COP - see loads.modulation.heat_lines.
-    min_power_w: float = 0.0
-    heat_lines: Optional[List[Tuple[float, float]]] = None
+    # An appliance whose power its own controller decides (EOS_connect extension): the
+    # plan only switches it, and in each slot it runs it draws power_w[t] - never more
+    # than max_power_w. None is max_power_w everywhere. power_curve, for a store, is the
+    # formula behind power_w, so the power can follow the temperature the plan makes;
+    # see PowerCurveConfig and Optimizer._refine_power_curves.
+    power_w: Optional[List[float]] = None
+    power_curve: Optional[PowerCurveConfig] = None
+
+    def power_at(self, t):
+        """The draw while running in slot *t*: its own power, else the rating."""
+        if self.power_w and t < len(self.power_w) and self.power_w[t] is not None:
+            value = max(0.0, float(self.power_w[t]))
+            return min(value, self.max_power_w) if self.max_power_w > 0 else value
+        return self.max_power_w
 
     def efficiency_at(self, t):
         """The efficiency of slot *t*, 1.0 where none was given."""
@@ -501,7 +555,10 @@ class Optimizer:
         self.strategy = strategy
         self.grid = grid
         self.batteries = batteries
-        self.managed_loads = list(managed_loads or [])
+        # Copies: the power-curve rounds give a load new per-slot powers, and the
+        # caller's configs are reused for other solves (the cost counterfactual, the
+        # charging-curve runs) that must start from what the model handed over.
+        self.managed_loads = [replace(load) for load in managed_loads or []]
         self.managed_load_budget_w = max(0.0, float(managed_load_budget_w or 0.0))
         self.time_series = time_series
         self.eta_c = eta_c
@@ -517,6 +574,8 @@ class Optimizer:
         self.variables: Dict[str, Any] = {}
         # Slots whose charging curve is held exactly, per battery (see solve()).
         self._curve_exact_slots: Dict[int, set] = {i: set() for i in range(len(batteries))}
+        # Re-solves that moved a heat pump's power to the planned temperature.
+        self.power_curve_rounds = 0
 
         # Compute scaling for strategy control parameters
         self.min_import_price = np.min(self.time_series.p_N) if self.time_series.p_N else 0.0
@@ -762,7 +821,7 @@ class Optimizer:
         self.variables['ml_on'] = {}
         for i, load in enumerate(self.managed_loads):
             per_slot = [
-                load.max_power_w * self.time_series.dt[t] / 3600.0
+                load.power_at(t) * self.time_series.dt[t] / 3600.0
                 for t in self.time_steps
             ]
             feasible = load.feasible or [True] * self.T
@@ -780,7 +839,7 @@ class Optimizer:
             # run to enforce, or starts being priced. Without either, the appliance may
             # be placed in any slot and the switch carries nothing the continuous
             # variable does not already have.
-            if load.min_runtime_slots > 1 or load.start_cost_eur > 0 or load.min_power_w > 0:
+            if load.min_runtime_slots > 1 or load.start_cost_eur > 0:
                 self.variables['ml_on'][i] = [
                     self._new_var(f"ml_on_{i}_{t}", cat='Binary')
                     for t in self.time_steps
@@ -1394,7 +1453,7 @@ class Optimizer:
                 continue
 
             for t in self.time_steps:
-                cap = load.max_power_w * self.time_series.dt[t] / 3600.0
+                cap = load.power_at(t) * self.time_series.dt[t] / 3600.0
                 allowed = t < len(feasible) and feasible[t]
                 if not allowed or cap <= 0:
                     self.problem += on[t] == 0
@@ -1406,18 +1465,12 @@ class Optimizer:
                 # gets scheduled in isolated slots anyway.
                 #
                 # So a load with a minimum run, or with starts priced, is modelled as
-                # on/off at its rated power, which is what a compressor does. The demand
-                # ceiling may then be met a slot short rather than exactly; that is the
-                # honest answer for something that cannot half-run.
-                if 0 < load.min_power_w < load.max_power_w:
-                    # A modulating appliance: running means at least its minimum, and
-                    # the plan picks the power above it. The lower bound keeps the
-                    # switch honest the same way the equality does for a fixed draw.
-                    floor = load.min_power_w * self.time_series.dt[t] / 3600.0
-                    self.problem += run[t] >= floor * on[t]
-                    self.problem += run[t] <= cap * on[t]
-                else:
-                    self.problem += run[t] == cap * on[t]
+                # on/off at its power, which is what a compressor does - its rating, or
+                # for a modulating pump the power its controller will pick in that slot
+                # (power_at). The demand ceiling may then be met a slot short rather
+                # than exactly; that is the honest answer for something that cannot
+                # half-run.
+                self.problem += run[t] == cap * on[t]
 
             self._add_commitment_constraints(load, on, feasible)
             self._add_switching_constraints(
@@ -1500,15 +1553,20 @@ class Optimizer:
         lows = self.variables['tm_lo'][i]
         highs = self.variables['tm_hi'][i]
         run = self.variables['ml'][i]
-        heat_in = self._modulated_heat(i, load) or run
+        curve = load.power_curve
         for t in self.time_steps:
             hours = self.time_series.dt[t] / 3600.0
             previous = store.t_initial if t == 0 else temps[t - 1]
             loss = min(store.at("loss_w_per_k", t) * hours, capacity)
+            # At the slot's own power the COP is the model's times the modulation
+            # factor: a pump pushed to its maximum buys less heat per Wh.
+            cop = store.at("cop", t, 1.0) * (
+                curve.factor(load.power_at(t)) if curve is not None else 1.0
+            )
             self.problem += (
                 capacity * temps[t]
                 == (capacity - loss) * previous
-                + store.at("cop", t, 1.0) * heat_in[t]
+                + cop * run[t]
                 + store.at("gain_wh", t)
                 + loss * store.at("ambient_c", t)
             )
@@ -1516,34 +1574,6 @@ class Optimizer:
             self.problem += temps[t] - highs[t] <= store.t_max
         # What is credited at the end: the final temperature, but no more than target.
         self.problem += self.variables['tm_end'][i] <= temps[-1]
-
-    def _modulated_heat(self, i, load):
-        """
-        Per slot, the drawn energy as the store feels it, for a modulating appliance.
-
-        The heat a Wh buys falls as the appliance runs harder. ``heat[t]`` stands for
-        it in the units of the store's per-slot COP and is held under each of the
-        appliance's heat lines - ``slope * E + intercept * hours * on`` - so it follows
-        the concave curve the user described. A slot that is off gets nothing: its
-        energy and switch are zero. None when the load has no lines; the drawn energy
-        then counts in full.
-
-        It is a ceiling, so a plan could take less heat than it pays for; it never has
-        a reason to, except to stay under the band's ceiling during a forced minimum
-        run - and then the real house would only be a little warmer than planned.
-        """
-        lines = load.heat_lines
-        on = self.variables['ml_on'].get(i)
-        if not lines or on is None:
-            return None
-        run = self.variables['ml'][i]
-        heat = [self._new_var(f"ml_heat_{i}_{t}", lowBound=0) for t in self.time_steps]
-        for t in self.time_steps:
-            hours = self.time_series.dt[t] / 3600.0
-            for slope, intercept_w in lines:
-                self.problem += heat[t] <= slope * run[t] + intercept_w * hours * on[t]
-        self.variables.setdefault('ml_heat', {})[i] = heat
-        return heat
 
     def _delivered(self, i, load):
         """A load's placed energy in units of its best slot."""
@@ -1615,7 +1645,7 @@ class Optimizer:
                 shares = []
                 for i in members:
                     load = self.managed_loads[i]
-                    cap = load.max_power_w * self.time_series.dt[t] / 3600.0
+                    cap = load.power_at(t) * self.time_series.dt[t] / 3600.0
                     if cap > 0:
                         shares.append(self.variables['ml'][i][t] * (1.0 / cap))
                 if len(shares) > 1:
@@ -1665,7 +1695,7 @@ class Optimizer:
             # Slots are not all the same length once the horizon changes resolution,
             # so the allowance is the dearest `allowed` of them, not a slot count.
             budget = sum(sorted(
-                (load.max_power_w * self.time_series.dt[t] / 3600.0 for t in usable),
+                (load.power_at(t) * self.time_series.dt[t] / 3600.0 for t in usable),
                 reverse=True,
             )[:allowed])
             self.problem += pulp.lpSum(run[t] for t in usable) <= budget
@@ -1686,7 +1716,7 @@ class Optimizer:
             # A store has no amount to run out of; its band is what ends a run.
             budget = max(0.0, load.demand_wh) if load.store is None else float("inf")
             for t in range(held_on):
-                cap = load.max_power_w * self.time_series.dt[t] / 3600.0
+                cap = load.power_at(t) * self.time_series.dt[t] / 3600.0
                 allowed = t < len(feasible) and feasible[t]
                 delivered = cap * load.efficiency_at(t)
                 if not allowed or cap <= 0 or delivered <= 0 or budget < delivered:
@@ -1733,6 +1763,137 @@ class Optimizer:
         # them to zero wherever it can and never needs the other direction pinned.
         for t in self.time_steps:
             self.problem += starts[t] >= edge(t)
+
+    def _refine_power_curves(self, solver, first_solve_s):
+        """
+        Re-solve until each heat pump's power matches the temperature the plan makes.
+
+        A load on a power curve (see PowerCurveConfig) is handed over with a power per
+        slot worked out from a *guess* of its store's temperature. Its real draw
+        follows the real temperature: flat out while the house is cold, throttled once
+        it is warm. After a solve the plan's own temperatures are known, so each slot's
+        power is worked out again from the temperature it starts at; where a running
+        slot's power moved by more than `POWER_CURVE_TOLERANCE_W`, every slot gets its
+        new power and the problem is solved again - the whole of it, because a heat
+        pump that turns out dearer to run at 21.0 C than at 21.6 C may belong in other
+        hours.
+
+        This is a fixed-point search, and on a flat day it can hop between placements
+        that cost the same: of the plans solved, the one whose running slots agree best
+        with its own temperatures stands. Measured against the curve, one round from
+        the model's guess brings a running slot within about 100-250 W - inside the
+        pump's own minute-to-minute wander.
+
+        Rounds share a time budget, like the charging curve's. A round that does not
+        finish is discarded.
+        """
+        if not any(
+            load.power_curve is not None and load.store is not None
+            and abs(load.power_curve.store_w_per_k) > 0
+            for load in self.managed_loads
+        ):
+            return
+        budget = max(self.POWER_CURVE_BUDGET_MIN_S,
+                     self.POWER_CURVE_BUDGET_FACTOR * first_solve_s)
+        if self.settings.time_limit:
+            budget = min(budget, float(self.settings.time_limit))
+        deadline = time.monotonic() + budget
+        own_limit = solver.timeLimit
+        curved = [
+            i for i, load in enumerate(self.managed_loads) if load.power_curve is not None
+        ]
+
+        def snapshot(mismatch):
+            return (
+                mismatch,
+                self.problem,
+                {key: dict(val) if isinstance(val, dict) else val
+                 for key, val in self.variables.items()},
+                {i: self.managed_loads[i].power_w for i in curved},
+                self.power_curve_rounds,
+            )
+
+        def restore(state):
+            _, self.problem, self.variables, powers, self.power_curve_rounds = state
+            for i, kept in powers.items():
+                self.managed_loads[i].power_w = kept
+
+        best = None
+        try:
+            for round_no in range(self.POWER_CURVE_ROUNDS + 1):
+                if (
+                    pulp.LpStatus[self.problem.status] != 'Optimal'
+                    or self.problem.sol_status != pulp.LpSolutionOptimal
+                ):
+                    break
+                updates, mismatch = self._power_curve_updates()
+                if best is None or mismatch < best[0]:
+                    best = snapshot(mismatch)
+                if not updates or round_no == self.POWER_CURVE_ROUNDS:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining < 0.5:
+                    logger.debug(
+                        "[OPT-LocalEVopt] Power curve: no time left for another round"
+                    )
+                    break
+                for i, powers in updates.items():
+                    self.managed_loads[i].power_w = powers
+                self.create_model()
+                solver.timeLimit = remaining if own_limit is None else min(own_limit, remaining)
+                self.problem.solve(solver)
+                if (
+                    pulp.LpStatus[self.problem.status] != 'Optimal'
+                    or self.problem.sol_status != pulp.LpSolutionOptimal
+                ):
+                    logger.info(
+                        "[OPT-LocalEVopt] Power curve: a round did not finish within "
+                        "%.0f s - keeping the plan solved before it",
+                        budget,
+                    )
+                    break
+                self.power_curve_rounds += 1
+        finally:
+            solver.timeLimit = own_limit
+            if best is not None and best[1] is not self.problem:
+                restore(best)
+
+    def _power_curve_updates(self):
+        """
+        Per load, the powers its curve gives at the temperatures just planned, where a
+        running slot moved by more than the tolerance; and the largest move of any
+        running slot - how far the plan disagrees with its own temperatures.
+        """
+        updates, mismatch = {}, 0.0
+        for i, load in enumerate(self.managed_loads):
+            curve = load.power_curve
+            temps = self.variables.get('tm', {}).get(i)
+            if curve is None or load.store is None or not temps:
+                continue
+            planned = [pulp.value(var) for var in temps]
+            run = self.variables['ml'][i]
+            new, moved = [], 0.0
+            for t in self.time_steps:
+                start = load.store.t_initial if t == 0 else planned[t - 1]
+                if start is None:
+                    start = load.store.t_initial
+                power = round(curve.power(t, start), 1)
+                new.append(power)
+                hours = self.time_series.dt[t] / 3600.0
+                if (pulp.value(run[t]) or 0.0) > 0.01 * max(1.0, load.power_at(t) * hours):
+                    moved = max(moved, abs(power - load.power_at(t)))
+            mismatch = max(mismatch, moved)
+            if moved > self.POWER_CURVE_TOLERANCE_W:
+                updates[i] = new
+        return updates, mismatch
+
+    # Re-solves for loads whose power follows their store's temperature (see solve()).
+    POWER_CURVE_ROUNDS = 2
+    # A running slot whose power moves by less than this is close enough: the pump's
+    # own control wanders by more than that from one minute to the next.
+    POWER_CURVE_TOLERANCE_W = 100.0
+    POWER_CURVE_BUDGET_FACTOR = 2.0
+    POWER_CURVE_BUDGET_MIN_S = 5.0
 
     def _refine_charge_curve(self, solver, first_solve_s):
         """
@@ -1870,7 +2031,11 @@ class Optimizer:
             solver.tmpDir = tmpdir
             started = time.monotonic()
             self.problem.solve(solver)
-            self._refine_charge_curve(solver, time.monotonic() - started)
+            first_solve_s = time.monotonic() - started
+            # Powers first: they move the heat pumps, and the charging curve's rounds
+            # then hold the pumps' switches where the final powers put them.
+            self._refine_power_curves(solver, first_solve_s)
+            self._refine_charge_curve(solver, first_solve_s)
 
         status = pulp.LpStatus[self.problem.status]
 
@@ -1917,6 +2082,9 @@ class Optimizer:
                         'energy': [
                             pulp.value(var) or 0.0 for var in self.variables['ml'][i]
                         ],
+                        # What it draws per slot while running - the power curve's
+                        # figure at the planned temperature, else the rating.
+                        'power': [load.power_at(t) for t in self.time_steps],
                         **({
                             'temperature': [
                                 pulp.value(var) for var in self.variables['tm'][i]

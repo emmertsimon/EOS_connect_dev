@@ -109,10 +109,14 @@ class EnergyDemand:
             past its daily runtime cap.
         max_power_w: Electrical power draw while running. Bounds how much energy the
             planner may put into a single slot.
-        min_power_w: A modulating appliance's lowest draw while running; the planner
-            then picks a power between it and max_power_w in every slot it runs.
-        modulation: ``[(power_w, factor), ...]`` - the COP across that range, as a
-            factor on the model's per-slot COP. Empty means the same COP throughout.
+        power_w: Per slot, the draw while running, for an appliance whose power is its
+            controller's choice (a modulating heat pump, see `loads.power_curve`): the
+            plan only switches it, and in each slot it runs it draws this. Empty means
+            ``max_power_w`` everywhere. Never above ``max_power_w``.
+        power_curve: The formula behind ``power_w``, for a solver that follows the
+            store's temperature and can therefore work the power out from the
+            temperature it plans: ``{"base_w": [per slot], "store_w_per_k", "ref_c",
+            "min_w", "max_w", "cop_factor": [[power_w, factor], ...]}``. None without.
         deadline_slot: Contingent only. Last slot the energy may occupy, or None for
             "anywhere in the horizon".
         efficiency: Contingent only. Per-slot worth of a Wh relative to the best slot,
@@ -135,11 +139,11 @@ class EnergyDemand:
     # Filled in by the planner: what became of every slot. See `loads.planner`.
     slot_reasons: list = field(default_factory=list)
     max_power_w: float = 0.0
-    # A modulating appliance: the least it draws while running, and how its COP
-    # changes with the power drawn (``[(power_w, factor), ...]``, see
-    # `loads.modulation`). 0 and [] for an appliance that runs at max_power_w only.
-    min_power_w: float = 0.0
-    modulation: list = field(default_factory=list)
+    # An appliance whose power its own controller decides: the draw per slot while
+    # running, and the formula behind it (see `loads.power_curve`). Empty and None for
+    # an appliance that runs at max_power_w.
+    power_w: list = field(default_factory=list)
+    power_curve: dict = None
     efficiency: list = field(default_factory=list)
     # Contingent only, and only for a store planned by its temperature rather than by
     # an amount: the physics the solver needs to follow the store slot by slot - see
@@ -149,6 +153,15 @@ class EnergyDemand:
     urgent: bool = False
     reason: str = ""
     detail: dict = field(default_factory=dict)
+
+    def power_at(self, index):
+        """The draw while running in slot *index*: its own power, else the rating."""
+        rated = float(self.max_power_w or 0.0)
+        if self.power_w and 0 <= index:
+            value = self.power_w[index] if index < len(self.power_w) else self.power_w[-1]
+            if value is not None and value > 0:
+                return min(float(value), rated) if rated > 0 else float(value)
+        return rated
 
     def is_empty(self):
         """True when there is nothing to inject and nothing to schedule."""

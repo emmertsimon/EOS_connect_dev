@@ -969,61 +969,139 @@ def test_a_store_that_leaks_faster_than_it_holds_stays_a_store():
     assert max(temps) <= 35.0
 
 
-# --- a modulating heat pump ---------------------------------------------------------------
+# --- a heat pump whose power its controller decides -----------------------------------------
 
-from src.loads.modulation import heat_lines  # noqa: E402
+from src.interfaces.optimization_backends.local_evopt.optimizer import (  # noqa: E402
+    PowerCurveConfig,
+)
 
-MEASURED_CURVE = [(400, 1.0), (800, 1.0), (1200, 0.93), (1500, 0.81), (1700, 0.74)]
+# Fitted on a Bosch CS6800iAW (Nov 2026): W at 0 C air with the house at 21 C, W per K
+# of air, W per K of house above 21 C.
+MEASURED_FACTORS = [(380, 1.0), (800, 1.0), (1200, 0.93), (1500, 0.81), (1700, 0.74),
+                    (2250, 0.60)]
 
 
-def _modulating(min_w=300.0, max_w=2800.0, curve=MEASURED_CURVE, **kwargs):
-    lines = heat_lines(curve, min_w, max_w) if curve else None
-    return _house(power=max_w, min_power_w=min_w, heat_lines=lines,
-                  min_runtime_slots=2, **kwargs)
+def _curve(ambient=5.0, factors=None):
+    return PowerCurveConfig(
+        base_w=[1810.0 - 109.0 * ambient] * T, store_w_per_k=-880.0, ref_c=21.0,
+        min_w=380.0, max_w=2250.0, cop_factor=list(factors or []),
+    )
+
+
+def _on_curve(t0=21.0, curve=None, guess=None, **kwargs):
+    curve = curve or _curve()
+    powers = list(guess) if guess is not None else [curve.power(t, t0) for t in range(T)]
+    kwargs.setdefault("min_runtime_slots", 2)
+    return _house(t0=t0, power=curve.max_w, power_w=powers, power_curve=curve, **kwargs)
 
 
 def _running(result):
     return [energy for energy in _placed(result, "house") if energy > 1e-6]
 
 
-def test_a_modulating_load_runs_between_its_minimum_and_its_maximum():
-    result = _optimizer([_modulating(t0=21.0)], battery=False).solve()
+def _power(result, load_id="house"):
+    for entry in result["managed_loads"]:
+        if entry["id"] == load_id:
+            return entry["power"]
+    raise AssertionError(f"no power returned for {load_id}")
+
+
+def test_it_runs_on_or_off_at_the_power_each_slot_gives():
+    """No power of the solver's choosing: a slot is off, or on at its own power."""
+    powers = [1500.0] * 12 + [600.0] * 12
+    load = _house(t0=21.0, power=2250.0, power_w=powers, min_runtime_slots=2)
+    result = _optimizer([load], battery=False).solve()
     assert result["status"] == "Optimal"
-    running = _running(result)  # hourly slots: Wh equals W
-    assert running
-    assert all(300 - 1e-6 <= energy <= 2800 + 1e-6 for energy in running)
+    placed = _placed(result, "house")  # hourly slots: Wh equals W
+    assert _running(result)
+    for t, energy in enumerate(placed):
+        assert energy < 1e-6 or energy == pytest.approx(powers[t], abs=1e-3), t
 
 
-def test_with_falling_efficiency_flat_prices_spread_the_heat_at_low_power():
-    """Same price every hour: the only reason left to pick a power is the heat it buys."""
-    result = _optimizer([_modulating(t0=21.0)], battery=False).solve()
-    assert max(_running(result)) <= 800 + 1e-6
+def test_a_slot_power_never_exceeds_the_rating():
+    load = _house(power=900.0, power_w=[5000.0] * T)
+    assert load.power_at(3) == 900.0
+    assert _house(power=900.0).power_at(3) == 900.0
 
 
-def test_a_nearly_free_hour_is_worth_full_power_anyway():
-    prices = [DEAR] * T
-    prices[2] = prices[3] = 0.000005
-    result = _optimizer([_modulating(t0=21.0)], prices=prices, battery=False).solve()
-    placed = _placed(result, "house")
-    assert max(placed[2], placed[3]) >= 1700 - 1e-6
+def _mismatch(result, curve, t0):
+    """How far a running slot's power is from the curve at its planned temperature."""
+    temps, powers, placed = _temperature(result), _power(result), _placed(result, "house")
+    return max(
+        abs(powers[t] - curve.power(t, t0 if t == 0 else temps[t - 1]))
+        for t, energy in enumerate(placed) if energy > 1e-6
+    )
 
 
-def test_the_house_warms_by_the_heat_bought_not_by_the_watts_drawn():
-    """At 2.8 kW the curve gives ~0.53 of the per-slot COP; the store must feel that."""
-    prices = [DEAR] * T
-    prices[2] = prices[3] = 0.000005
-    opt = _optimizer([_modulating(t0=21.0)], prices=prices, battery=False)
+def _relaxed_guess(curve, t0, target=21.5, hours=6.0):
+    """The model's first guess: the house settling from where it is back to target."""
+    import math
+    return [curve.power(t, target + (t0 - target) * math.exp(-t / hours)) for t in range(T)]
+
+
+def test_the_power_follows_the_temperature_the_plan_makes():
+    """
+    From the model's guess the solver works each running slot's power out again from
+    the temperature it plans, and lands inside the pump's own wander of it.
+    """
+    curve = _curve()
+    opt = _optimizer([_on_curve(t0=20.8, guess=_relaxed_guess(curve, 20.8))], battery=False)
     result = opt.solve()
-    heat = [pulp.value(var) for var in opt.variables['ml_heat'][0]]
-    for drawn, felt in zip(_placed(result, "house"), heat):
-        expected = min(s * drawn + i for s, i in heat_lines(MEASURED_CURVE, 300, 2800)) if drawn > 1e-6 else 0.0
-        assert felt <= expected + 1e-3
+    assert result["status"] == "Optimal"
+    assert _mismatch(result, curve, 20.8) <= 150.0
 
 
-def test_without_a_minimum_the_load_still_runs_at_its_rated_power_only():
+def test_a_bad_guess_is_corrected_by_the_rounds():
+    curve = _curve()
+    guess = [380.0] * T  # the minimum everywhere: off by up to 1.4 kW
+    no_rounds = _optimizer([_on_curve(t0=20.8, guess=guess)], battery=False)
+    no_rounds.POWER_CURVE_ROUNDS = 0
+    before = _mismatch(no_rounds.solve(), curve, 20.8)
+    opt = _optimizer([_on_curve(t0=20.8, guess=guess)], battery=False)
+    after = _mismatch(opt.solve(), curve, 20.8)
+    assert opt.power_curve_rounds >= 1
+    assert before > 1000 and after < 0.4 * before
+
+
+def test_the_warmer_the_house_the_less_it_draws_through_a_run():
+    opt = _optimizer([_on_curve(t0=20.6)], battery=False)
+    result = opt.solve()
+    placed, powers = _placed(result, "house"), _power(result)
+    first_run = []
+    for t, energy in enumerate(placed):
+        if energy > 1e-6:
+            first_run.append(powers[t])
+        elif first_run:
+            break
+    assert len(first_run) >= 2
+    assert first_run[-1] < first_run[0]
+
+
+def test_the_house_warms_by_the_cop_at_the_power_it_runs_at():
+    """Flat out the modulation factor is 0.6: the store feels 0.6 of the COP."""
+    curve = _curve(ambient=-5.0, factors=MEASURED_FACTORS)  # 2355 W raw: held at 2250
+    opt = _optimizer([_on_curve(t0=20.0, curve=curve, min_runtime_slots=1)], battery=False)
+    result = opt.solve()
+    placed, temps = _placed(result, "house"), _temperature(result)
+    assert placed[0] == pytest.approx(2250.0, abs=1e-3)
+    loss = HOUSE_H * 1.0
+    expected = ((HOUSE_C - loss) * 20.0 + 3.5 * 0.6 * 2250.0 + loss * 5.0) / HOUSE_C
+    assert temps[0] == pytest.approx(expected, abs=1e-6)
+
+
+def test_the_rounds_leave_the_callers_config_alone():
+    load = _on_curve(t0=20.8, guess=[380.0] * T)
+    opt = _optimizer([load], battery=False)
+    opt.solve()
+    assert load.power_w == [380.0] * T
+    assert opt.managed_loads[0] is not load
+
+
+def test_without_a_curve_the_load_still_runs_at_its_rated_power_only():
     load = _house(t0=21.0, power=900.0, min_runtime_slots=2)
     result = _optimizer([load], battery=False).solve()
     assert all(abs(energy - 900.0) < 1e-3 for energy in _running(result))
+    assert set(_power(result)) == {900.0}
 
 # --- leftover heat and leftover charge on one footing ---------------------------------------
 

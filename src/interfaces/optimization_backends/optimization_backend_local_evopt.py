@@ -38,6 +38,7 @@ from .local_evopt.optimizer import (
     CbcSolverUnavailableError,
     GridConfig,
     ManagedLoadConfig,
+    PowerCurveConfig,
     ThermalStoreConfig,
     OptimizationStrategy,
     Optimizer,
@@ -242,6 +243,13 @@ class LocalEVOptBackend(EVOptBackend):
                 evopt_response.get("status", "unknown"),
                 self.cbc_path or "unresolved",
             )
+            rounds = getattr(optimizer, "power_curve_rounds", 0) if optimizer else 0
+            if rounds:
+                logger.info(
+                    "[OPT-LocalEVopt] Power curve: %d re-solve(s) to match heat pump "
+                    "power to the planned temperature",
+                    rounds,
+                )
 
             # Update rolling average runtime
             if all(r == 0 for r in self.last_optimization_runtimes):
@@ -680,13 +688,6 @@ class LocalEVOptBackend(EVOptBackend):
                 continue
 
             mask = entry.get("feasible")
-            min_power = float(entry.get("min_power_w", 0) or 0)
-            if not 0 < min_power < power:
-                min_power = 0.0
-            lines = [
-                (float(slope), float(intercept))
-                for slope, intercept in (entry.get("heat_lines") or [])
-            ] if min_power and store else None
             configs.append(ManagedLoadConfig(
                 id=str(entry.get("id", "")),
                 demand_wh=demand,
@@ -706,8 +707,11 @@ class LocalEVOptBackend(EVOptBackend):
                 efficiency=self._solver_efficiency(entry.get("efficiency")),
                 exclusive_group=str(entry.get("exclusive_group", "") or "").strip(),
                 store=store,
-                min_power_w=min_power,
-                heat_lines=lines or None,
+                power_w=self._solver_power(entry.get("power_w")),
+                power_curve=(
+                    self._solver_power_curve(entry.get("power_curve"))
+                    if store is not None else None
+                ),
             ))
         if configs:
             logger.debug(
@@ -722,6 +726,8 @@ class LocalEVOptBackend(EVOptBackend):
 
     # Per-slot fields of a managed-load record, with what pads a slot that has none.
     _RECORD_SLOT_FIELDS = (("feasible", True), ("efficiency", 1.0), ("day_index", -1))
+    # Physical per-slot series: the last value is carried on rather than a fill.
+    _RECORD_CARRIED_FIELDS = ("power_w",)
     _STORE_SLOT_FIELDS = ("loss_w_per_k", "ambient_c", "cop", "gain_wh")
 
     def _on_run_anchor(self, entry):
@@ -751,6 +757,15 @@ class LocalEVOptBackend(EVOptBackend):
         for key, fill in self._RECORD_SLOT_FIELDS:
             if moved.get(key):
                 moved[key] = reanchor(moved[key], shift, fill)
+        for key in self._RECORD_CARRIED_FIELDS:
+            values = moved.get(key)
+            if values:
+                moved[key] = reanchor(values, shift, values[-1])
+        curve = moved.get("power_curve")
+        if isinstance(curve, dict) and curve.get("base_w"):
+            moved["power_curve"] = {
+                **curve, "base_w": reanchor(curve["base_w"], shift, curve["base_w"][-1]),
+            }
         store = moved.get("store")
         if isinstance(store, dict):
             store = dict(store)
@@ -797,6 +812,46 @@ class LocalEVOptBackend(EVOptBackend):
                 "[OPT-LocalEVopt] unreadable thermal store - falling back to the "
                 "load's energy demand, and where it has none the load is left to "
                 "plan itself this cycle"
+            )
+            return None
+
+    def _solver_power(self, series):
+        """A per-slot power series in solver space, or None for a load at its rating."""
+        if not series:
+            return None
+        try:
+            values = [float(value) for value in series]
+        except (TypeError, ValueError):
+            logger.warning("[OPT-LocalEVopt] unreadable power series - planning at the rating")
+            return None
+        return self.to_solver_slots(values, fill=values[-1])
+
+    def _solver_power_curve(self, curve):
+        """
+        A load's power curve in solver space, or None.
+
+        Unreadable is not fatal: the per-slot powers the model worked out still go to
+        the solver, only without being moved to the temperature it plans.
+        """
+        if not isinstance(curve, dict) or not curve.get("base_w"):
+            return None
+        try:
+            base = [float(value) for value in curve["base_w"]]
+            return PowerCurveConfig(
+                base_w=self.to_solver_slots(base, fill=base[-1]),
+                store_w_per_k=float(curve.get("store_w_per_k") or 0.0),
+                ref_c=float(curve.get("ref_c") or 0.0),
+                min_w=float(curve.get("min_w") or 0.0),
+                max_w=float(curve.get("max_w") or 0.0),
+                cop_factor=[
+                    (float(power), float(factor))
+                    for power, factor in (curve.get("cop_factor") or [])
+                ],
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "[OPT-LocalEVopt] unreadable power curve - planning the load at the "
+                "per-slot powers it came with"
             )
             return None
 
