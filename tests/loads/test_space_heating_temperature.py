@@ -177,33 +177,140 @@ def test_a_store_without_a_demand_waits_for_the_solver_it_was_offered_to(
     )
 
 
-def test_a_modulating_heat_pump_hands_its_range_and_heat_lines_to_the_solver(
+CURVE = "base:1810, air:-109, store:-880, ref:21"
+
+
+def _curve_manager(make_manager, installation, rooms=21.2, **overrides):
+    settings = dict(rated_power_w=2250, min_power_w=380, power_curve=CURVE,
+                    power_curve_learning=False)
+    settings.update(overrides)
+    return _house_manager(make_manager, installation, rooms=rooms, **settings)
+
+
+def test_a_heat_pump_on_a_curve_hands_its_power_per_slot_to_the_solver(
     make_manager, installation
 ):
-    manager = _house_manager(
-        make_manager, installation, rated_power_w=2800, min_power_w=300,
-        modulation_cop="400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74",
-    )
+    """
+    The plan switches it; what it draws while on is the curve's - more in the cold
+    hours (5 C) than in the mild ones (9 C), less the warmer the house.
+    """
+    manager = _curve_manager(make_manager, installation)
     record = manager.schedulable()[0]
-    assert record["max_power_w"] == 2800 and record["min_power_w"] == 300
-    slopes = [slope for slope, _ in record["heat_lines"]]
-    assert slopes[0] == pytest.approx(1.0) and slopes == sorted(slopes, reverse=True)
+    ctx = manager._last_ctx_for["house"]
+    powers, curve = record["power_w"], record["power_curve"]
+    assert len(powers) == ctx.slot_count == len(curve["base_w"])
+    assert curve["store_w_per_k"] == pytest.approx(-880)
+    assert curve["ref_c"] == pytest.approx(21.0)
+    assert (curve["min_w"], curve["max_w"]) == (380, 2250)
+    now = ctx.current_slot
+    # In the running slot the store is where it is: 21.2 C, 0.2 K above ref.
+    assert powers[now] == pytest.approx(curve["base_w"][now] - 880 * 0.2, abs=0.2)
+    air = ctx.ambient_temp_c
+    cold = [i for i in range(now, ctx.slot_count) if air[i] < 6]
+    mild = [i for i in range(now, ctx.slot_count) if air[i] > 8]
+    assert cold and mild
+    assert min(powers[i] for i in cold) > max(powers[i] for i in mild)
+    assert all(380 <= p <= 2250 for p in powers)
 
 
-def test_a_fixed_heat_pump_hands_over_no_range(make_manager, installation):
+def test_the_curve_draw_is_on_the_card(make_manager, installation):
+    manager = _curve_manager(make_manager, installation)
+    item = manager.instance("house")
+    now = manager._last_ctx_for["house"].current_slot
+    detail = item.last_demand.detail
+    assert detail["power_curve"]["source"] == "configured"
+    assert detail["power_curve"]["curve"]["store_w_per_k"] == pytest.approx(-880)
+    assert detail["electrical_power_w"] == pytest.approx(item.last_demand.power_w[now], abs=0.1)
+
+
+def test_a_fixed_heat_pump_hands_over_no_curve(make_manager, installation):
     record = _house_manager(make_manager, installation).schedulable()[0]
-    assert record["min_power_w"] == 0 and record["heat_lines"] == []
+    assert record["power_w"] is None and record["power_curve"] is None
+
+
+def test_a_minimum_power_alone_starts_the_curve_at_the_rating(make_manager, installation):
+    """A modulating pump without a curve yet: its rating everywhere until it learns."""
+    record = _house_manager(
+        make_manager, installation, rated_power_w=2800, min_power_w=300,
+    ).schedulable()[0]
+    assert set(record["power_w"]) == {2800.0}
+    assert record["power_curve"]["store_w_per_k"] == 0
+
+
+def test_a_broken_power_curve_is_dropped_with_a_warning(make_manager, installation, caplog):
+    with caplog.at_level("WARNING"):
+        manager = _curve_manager(make_manager, installation, power_curve="base=lots")
+    record = manager.schedulable()[0]
+    assert "power_curve ignored" in caplog.text
+    assert set(record["power_w"]) == {2250.0}
+
+
+def test_the_modulation_factor_rides_along_with_the_curve(make_manager, installation):
+    record = _curve_manager(
+        make_manager, installation,
+        modulation_cop="400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74",
+    ).schedulable()[0]
+    table = record["power_curve"]["cop_factor"]
+    assert table[0] == [380.0, 1.0]
+    assert table[-1][0] == 2250.0 and table[-1][1] < 0.74
 
 
 def test_a_broken_modulation_curve_is_dropped_with_a_warning(make_manager, installation, caplog):
     with caplog.at_level("WARNING"):
-        manager = _house_manager(
-            make_manager, installation, rated_power_w=2800, min_power_w=300,
-            modulation_cop="400-1.0",
-        )
+        manager = _curve_manager(make_manager, installation, modulation_cop="400-1.0")
     record = manager.schedulable()[0]
-    assert record["min_power_w"] == 300 and record["heat_lines"] == []
+    assert record["power_curve"]["cop_factor"] == []
     assert "modulation_cop ignored" in caplog.text
+
+
+def test_the_curve_makes_it_into_solver_space(make_manager, installation):
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+    from zoneinfo import ZoneInfo
+
+    from src.interfaces.optimization_backends.optimization_backend_local_evopt import (
+        LocalEVOptBackend,
+    )
+
+    record = _curve_manager(make_manager, installation).schedulable()[0]
+    backend = LocalEVOptBackend.__new__(LocalEVOptBackend)
+    backend.time_zone = ZoneInfo("Europe/Berlin")
+    backend.time_frame_base = 3600
+    moment = datetime(2026, 6, 1, 6, 30, tzinfo=backend.time_zone)
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment
+
+    with patch(
+        "src.interfaces.optimization_backends.optimization_backend_evopt.datetime",
+        _Clock,
+    ):
+        record["anchor"] = moment.replace(hour=0, minute=0).isoformat()
+        load = backend._managed_load_configs([record])[0]
+        # A record from yesterday's grid is moved onto today's like every other series.
+        stale = dict(record, anchor=(moment.replace(hour=0, minute=0)
+                                     - timedelta(days=1)).isoformat())
+        moved = backend._managed_load_configs([stale])[0]
+    # Rotated: solver slot 0 is 06:00.
+    assert load.power_w[0] == pytest.approx(record["power_w"][6])
+    assert load.power_curve.base_w[0] == pytest.approx(record["power_curve"]["base_w"][6])
+    assert load.power_curve.store_w_per_k == pytest.approx(-880)
+    assert load.power_at(0) <= load.max_power_w == 2250
+    assert moved.power_w[0] == pytest.approx(record["power_w"][6 + 24])
+
+
+def test_a_slot_planned_at_the_curve_power_releases(make_manager, installation):
+    manager = _curve_manager(make_manager, installation, rooms=21.3, min_runtime_minutes=0)
+    item = manager.instance("house")
+    ctx = manager._last_ctx_for["house"]
+    plan = [0.0] * 48
+    plan[ctx.current_slot] = item.last_demand.power_at(ctx.current_slot)
+    assert item.adopt_schedule(plan, ctx)["released"] is True
+    plan[ctx.current_slot] = 0.2 * item.last_demand.power_at(ctx.current_slot)
+    assert item.adopt_schedule(plan, ctx)["released"] is False
+
 
 # --- what counts as "planned to run" ----------------------------------------------------------
 

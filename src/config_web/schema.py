@@ -3018,14 +3018,51 @@ _ALL_FIELDS: list[FieldDef] = [
         level="expert",
         description=(
             "For a modulating appliance such as an inverter heat pump: the least it "
-            "draws while running, in watts. Rated power is then the most it draws, and "
-            "the built-in optimizer picks a power in between for every slot it runs - "
-            "published as Planned Power, for an automation to turn into a setpoint. "
-            "0 = it runs at rated power only"
+            "draws while running, in watts. Rated power is then the most it draws. Its "
+            "own controller picks the power in between, so the plan only switches it on "
+            "or off and counts each slot at the Power Curve's figure - published as "
+            "Planned Power. 0 = it runs at rated power only"
         ),
         labels=["restart_required"],
         help_url="config-managed-loads.html#managed-loads-modulation",
         validation={"min": 0, "max": 100000},
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Physical",
+    ),
+    FieldDef(
+        key="managed_loads.power_curve",
+        field_type="str",
+        default="",
+        section="managed_loads",
+        level="expert",
+        description=(
+            "What a modulating heat pump draws while running, as 'name:value' terms of "
+            "P = base + air * T_air + store * (T_store - ref), held between Minimum and "
+            "Rated Power - e.g. 'base:1810, air:-109, store:-880, ref:21' (W at 0 C "
+            "outside with the house at 21 C; 109 W more per kelvin colder; 880 W less "
+            "per kelvin warmer inside). The starting point: with Power Curve Learning "
+            "the recorded runs refine it. Empty with a minimum power = start at rated "
+            "power and learn"
+        ),
+        labels=["restart_required"],
+        help_url="config-managed-loads.html#managed-loads-modulation",
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Physical",
+    ),
+    FieldDef(
+        key="managed_loads.power_curve_learning",
+        field_type="bool",
+        default=True,
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Refine the Power Curve from the power sensor: every settled running sample "
+            "(metered power, air and store temperature) of the last two weeks, with the "
+            "configured curve counting as a dozen measurements spread across the weather. "
+            "Off = use the configured curve as it is"
+        ),
+        labels=["restart_required"],
+        help_url="config-managed-loads.html#managed-loads-modulation",
         depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
         display_group="Physical",
     ),
@@ -3039,8 +3076,8 @@ _ALL_FIELDS: list[FieldDef] = [
             "How the efficiency changes with the power drawn, as 'W:factor' points on "
             "the COP the model works out from the air temperature - e.g. "
             "'400:1.0, 800:1.0, 1200:0.93, 1500:0.81, 1700:0.74'. Linear in between, "
-            "flat outside. Only used with a minimum power. Empty = the same COP at "
-            "every power"
+            "flat below. Each slot's COP is scaled by the factor at the power the Power "
+            "Curve gives it. Empty = the same COP at every power"
         ),
         labels=["restart_required"],
         help_url="config-managed-loads.html#managed-loads-modulation",
