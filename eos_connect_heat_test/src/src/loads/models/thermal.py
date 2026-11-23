@@ -22,6 +22,7 @@ is off, or a pump that hunts around its setpoint.
 """
 
 import logging
+import math
 from datetime import timedelta
 
 from .. import efficiency as slot_efficiency
@@ -52,6 +53,7 @@ REASON_NO_TEMPERATURE = "temperature sensor unavailable"
 REASON_AT_TARGET = "at target temperature"
 REASON_IN_DEADBAND = "within deadband - not starting"
 REASON_FROST = "frost protection"
+REASON_SOFT_LIMIT = "below soft limit - charging in the next allowed window"
 REASON_HEATING = "below target temperature"
 REASON_HOLDING = "covering standing losses"
 REASON_OUT_OF_SEASON = "out of season"
@@ -265,6 +267,13 @@ class ThermalStorageModel(BaseDemandModel):
 
         self.min_ambient_temp_c = config.get("min_ambient_temp_c")
         self.frost_protection_temp_c = config.get("frost_protection_temp_c")
+        # The soft limit: below it the store must be charged within its next allowed
+        # window whatever the price limit says - see `_must_run`. 0 or empty is off.
+        soft = _as_float(config.get("soft_limit_temp_c"))
+        self.soft_limit_temp_c = soft if soft is not None and soft > 0 else None
+        self.soft_limit_hours = max(
+            0.0, _as_float(config.get("soft_limit_hours"), 0.0) or 0.0
+        )
         self.window_start = config.get("window_start")
         self.window_end = config.get("window_end")
         self.deadline_hours = config.get("deadline_hours")
@@ -568,6 +577,27 @@ class ThermalStorageModel(BaseDemandModel):
             if power_w and 0 <= ctx.current_slot < len(power_w) else self.rated_power_w
         )
 
+        # The charge that has to happen: below the hard limit at once, below the soft
+        # limit within the next allowed window, either way whatever the price limit
+        # says. A store planned by temperature has its floor in the band instead.
+        below_soft = (
+            self.soft_limit_temp_c is not None
+            and current < float(self.soft_limit_temp_c)
+        )
+        must_wh, must_slots, must_by = 0.0, [], None
+        if store is None and not circuit_off and (urgent or below_soft):
+            cop = reference_cop or mean_cop
+            must_wh = min(total_wh, thermal_to_electrical_wh(heat_up_wh, cop))
+            feasible, feasible_reason, must_slots, must_by = self._must_run(
+                ctx, feasible, feasible_reason, must_wh, urgent, power_now
+            )
+            if not must_slots:
+                must_wh = 0.0
+            elif not urgent:
+                # The soft limit sits below the deadband as a rule, but where it does
+                # not, being under it is reason enough to start.
+                active, reason = True, REASON_SOFT_LIMIT
+
         return EnergyDemand(
             kind=self.kind,
             total_wh=total_wh,
@@ -580,9 +610,19 @@ class ThermalStorageModel(BaseDemandModel):
             store=store,
             deadline_slot=deadline_slot,
             urgent=urgent and active,
+            must_wh=must_wh,
+            must_slots=must_slots,
             reason=reason,
             detail={
                 "active": active,
+                # The charge the limits demand: how much, and by when.
+                "soft_limit_c": self.soft_limit_temp_c,
+                "hard_limit_c": (
+                    _as_float(self.frost_protection_temp_c)
+                    if self.frost_protection_temp_c not in (None, "") else None
+                ),
+                "must_wh": round(must_wh, 1),
+                "must_by": must_by.isoformat() if must_by is not None else None,
                 # Whether a solver following the temperature may run it now: anywhere
                 # below the storage ceiling, because inside the band the plan - not a
                 # deadband - decides when heat is worth putting in.
@@ -882,6 +922,60 @@ class ThermalStorageModel(BaseDemandModel):
         if self.is_running(readings):
             return True, REASON_HOLDING
         return False, REASON_IN_DEADBAND
+
+    def _must_run(self, ctx, feasible, feasible_reason, must_wh, urgent, power_w):
+        """
+        Where the charge the limits demand has to land.
+
+        Returns ``(feasible, feasible_reason, must_slots, must_by)``: the mask and its
+        reasons (opened where the hard limit needs it), a per-slot mask of the slots
+        the charge counts in, and the end of the last of them.
+
+        Below the hard limit the store is charged now: the next run's worth of slots
+        from the current one, with the window, season and air limit set aside for
+        them - a tank at 30 C is not left until tomorrow's window. Below the soft limit
+        the charge belongs in the next allowed window, the one running now or the first
+        one ahead, and ``soft_limit_hours`` can pull its end in. Inside those slots the
+        plan still picks the cheapest; only the price limit stops counting.
+        """
+        start = max(0, ctx.current_slot)
+        count = ctx.slot_count
+        if start >= count or must_wh <= 0:
+            return feasible, feasible_reason, [], None
+        feasible = list(feasible) + [True] * max(0, count - len(feasible))
+        feasible_reason = (
+            list(feasible_reason or []) + [None] * max(0, count - len(feasible_reason or []))
+        )
+        slot_wh = max(0.0, float(power_w or 0.0)) * ctx.hours_per_slot()
+        run_slots = (
+            max(1, int(math.ceil(must_wh / slot_wh))) if slot_wh > 0 else 1
+        )
+
+        if urgent:
+            last = min(count - 1, start + max(run_slots, ctx.slots_per_hour()))
+            for index in range(start, last + 1):
+                feasible[index] = True
+                feasible_reason[index] = None
+        else:
+            first = next(
+                (index for index in range(start, count) if feasible[index]), None
+            )
+            if first is None:
+                return feasible, feasible_reason, [], None
+            last = first
+            while last + 1 < count and feasible[last + 1]:
+                last += 1
+            if self.soft_limit_hours > 0:
+                limit = start + int(
+                    math.ceil(self.soft_limit_hours * ctx.slots_per_hour())
+                ) - 1
+                last = min(last, max(limit, first + run_slots - 1))
+
+        must_slots = [
+            start <= index <= last and bool(feasible[index]) for index in range(count)
+        ]
+        must_by = ctx.anchor + timedelta(seconds=(last + 1) * ctx.time_frame_base)
+        return feasible, feasible_reason, must_slots, must_by
 
     # -- calibration ----------------------------------------------------------------------
 

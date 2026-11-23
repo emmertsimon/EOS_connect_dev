@@ -6,7 +6,9 @@ Ladekurven-PRs (`feature/charging-curve-points-v2` Stützpunkte, `feature/chargi
 (`feature/ha-inverter-charge-limit`, EOS schickt die max. Ladeleistung an HA) und der modulierenden
 Wärmepumpe (`feature/modulating-heat-pump`, Teillast-COP) und der Leistungskurve
 (`feature/heating-power-curve`: WP nur an/aus, Leistung pro Slot aus einer aus den Läufen
-gelernten Formel über Außen- und Haustemperatur) obendrauf.
+gelernten Formel über Außen- und Haustemperatur) und dem Soft-/Hard-Limit für Speicher
+(`feature/dhw-soft-hard-limit`: unter `soft_limit_temp_c` eine Ladung im nächsten Fenster trotz
+Preisgrenze, unter `frost_protection_temp_c` sofort) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).

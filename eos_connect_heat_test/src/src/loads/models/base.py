@@ -125,6 +125,11 @@ class EnergyDemand:
         urgent: Skip price optimization and run as soon as feasible. Frost protection
             and a missed deadline both set this - being cheap is worthless if the pool
             freezes.
+        must_wh: Contingent only. Energy that has to be placed in ``must_slots``
+            whatever the price limit says - the charge a store's soft or hard limit
+            calls for. In the same units as ``total_wh`` and never above it; 0 for none.
+        must_slots: Per-slot mask of where ``must_wh`` counts. Inside it the cheapest
+            slots still win; empty when there is no such charge.
         reason: Short human-readable explanation, surfaced on MQTT and the dashboard.
         detail: Model-specific extras for the status API.
     """
@@ -151,6 +156,8 @@ class EnergyDemand:
     store: dict = None
     deadline_slot: object = None
     urgent: bool = False
+    must_wh: float = 0.0
+    must_slots: list = field(default_factory=list)
     reason: str = ""
     detail: dict = field(default_factory=dict)
 

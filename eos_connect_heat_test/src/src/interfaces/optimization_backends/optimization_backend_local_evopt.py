@@ -698,6 +698,11 @@ class LocalEVOptBackend(EVOptBackend):
                 max_power_w=power,
                 min_runtime_slots=max(1, int(entry.get("min_runtime_slots", 1) or 1)),
                 urgent_wh=float(entry.get("urgent_wh", 0) or 0),
+                must_wh=float(entry.get("must_wh", 0) or 0),
+                must_slots=(
+                    self.to_solver_slots(entry.get("must_slots"), fill=False)
+                    if entry.get("must_slots") else None
+                ),
                 start_cost_eur=float(entry.get("start_cost_eur", 0) or 0),
                 max_slots_per_day=max(0, int(entry.get("max_slots_per_day", 0) or 0)),
                 day_index=self.to_solver_slots(entry.get("day_index"), fill=-1),
@@ -725,7 +730,10 @@ class LocalEVOptBackend(EVOptBackend):
         return local_midnight(self.time_zone, self._now())
 
     # Per-slot fields of a managed-load record, with what pads a slot that has none.
-    _RECORD_SLOT_FIELDS = (("feasible", True), ("efficiency", 1.0), ("day_index", -1))
+    _RECORD_SLOT_FIELDS = (
+        ("feasible", True), ("efficiency", 1.0), ("day_index", -1),
+        ("must_slots", False),
+    )
     # Physical per-slot series: the last value is carried on rather than a fill.
     _RECORD_CARRIED_FIELDS = ("power_w",)
     _STORE_SLOT_FIELDS = ("loss_w_per_k", "ambient_c", "cop", "gain_wh")

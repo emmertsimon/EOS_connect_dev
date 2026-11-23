@@ -192,6 +192,12 @@ def _padded(mask, length):
     return values + [True] * (length - len(values))
 
 
+def _padded_off(mask, length):
+    """A per-slot mask at the horizon length, missing slots *not* included."""
+    values = [bool(value) for value in (mask or [])][:length]
+    return values + [False] * (length - len(values))
+
+
 def _padded_efficiency(values, length):
     """An efficiency series at the horizon length, or None for a load without one."""
     if not values:
@@ -646,8 +652,19 @@ class ManagedLoadManager:
                 "efficiency": _padded_efficiency(demand.efficiency, slots),
                 "exclusive_group": item.exclusive_group,
                 "min_runtime_slots": item.min_runtime_slots(ctx) if ctx else 1,
+                # The charge a soft or hard limit calls for, and where it counts. It
+                # replaces the urgent amount wherever the model states one: urgency
+                # asked for the whole horizon's demand at once, which a window or an
+                # on/off run could not hold, and the model went infeasible.
+                "must_wh": round(float(getattr(demand, "must_wh", 0.0) or 0.0), 1),
+                "must_slots": (
+                    _padded_off(demand.must_slots, slots)
+                    if getattr(demand, "must_wh", 0.0) else []
+                ),
                 "urgent_wh": (
-                    float(demand.total_wh) if demand.urgent and demand.store is None
+                    float(demand.total_wh)
+                    if demand.urgent and demand.store is None
+                    and not getattr(demand, "must_wh", 0.0)
                     else 0.0
                 ),
                 "store": demand.store,
