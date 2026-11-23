@@ -283,8 +283,8 @@ def plan_contingent(demand, ctx, options, budget_wh=None):
     if remaining <= 0:
         return plan
 
-    slot_capacity = demand.max_power_w * ctx.hours_per_slot()
-    if slot_capacity <= 0:
+    hours = ctx.hours_per_slot()
+    if demand.max_power_w * hours <= 0:
         logger.warning(
             "[LOADS] managed load has demand but no power rating - cannot place it"
         )
@@ -292,7 +292,9 @@ def plan_contingent(demand, ctx, options, budget_wh=None):
 
     caps = []
     for index in range(length):
-        cap = slot_capacity
+        # An appliance on a power curve draws its own power per slot (see
+        # `EnergyDemand.power_w`); everything else its rating.
+        cap = demand.power_at(index) * hours
         if budget_wh is not None:
             cap = min(cap, max(0.0, budget_wh[index]))
         caps.append(cap)

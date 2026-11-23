@@ -4,7 +4,9 @@ Test-Add-on: aktueller `ohAnd/EOS_connect` develop (0.3.42.400, inkl. #380 Ladek
 (`feature/space-heating-managed-loads`, inkl. ohAnds Commits vom 14.11.) und dem
 Ladekurven-PRs (`feature/charging-curve-points-v2` Stützpunkte, `feature/charging-curve-exact` genaue Planung) und dem Ladegrenzen-PR
 (`feature/ha-inverter-charge-limit`, EOS schickt die max. Ladeleistung an HA) und der modulierenden
-Wärmepumpe (`feature/modulating-heat-pump`, Leistung zwischen min. und max. mit Teillast-COP) obendrauf.
+Wärmepumpe (`feature/modulating-heat-pump`, Teillast-COP) und der Leistungskurve
+(`feature/heating-power-curve`: WP nur an/aus, Leistung pro Slot aus einer aus den Läufen
+gelernten Formel über Außen- und Haustemperatur) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).

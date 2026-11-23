@@ -32,7 +32,6 @@ from .contribution import (
 )
 from .injection import InjectionError, parse_push, profile_from_entries
 from .instance import ManagedLoad
-from .modulation import heat_lines
 from .models.base import DemandContext
 from .presets import (
     EXTERNAL_TYPES, fallback_ambient_c, pulls_its_profile, uses_outdoor_ambient,
@@ -199,6 +198,21 @@ def _padded_efficiency(values, length):
         return None
     series = [float(value) for value in values][:length]
     return series + [1.0] * (length - len(series))
+
+
+def _padded_series(values, length):
+    """A per-slot series at the horizon length, the last value carried on; or None."""
+    if not values:
+        return None
+    series = [float(value) for value in values][:length]
+    return series + [series[-1]] * (length - len(series))
+
+
+def _padded_curve(curve, length):
+    """A power curve record with its per-slot base at the horizon length; or None."""
+    if not isinstance(curve, dict) or not curve.get("base_w"):
+        return None
+    return {**curve, "base_w": _padded_series(curve["base_w"], length)}
 
 
 def _parse_anchor(value):
@@ -619,15 +633,12 @@ class ManagedLoadManager:
                 "anchor": ctx.anchor.isoformat() if ctx else None,
                 "demand_wh": round(float(demand.total_wh), 1),
                 "max_power_w": float(demand.max_power_w),
-                # A modulating appliance: the least it draws while running, and the
-                # heat per Wh across its range as solver lines (loads.modulation).
-                "min_power_w": float(demand.min_power_w or 0.0),
-                "heat_lines": [
-                    [round(slope, 6), round(intercept, 3)]
-                    for slope, intercept in heat_lines(
-                        demand.modulation, demand.min_power_w, demand.max_power_w
-                    )
-                ],
+                # An appliance whose power its controller decides: per slot, what it
+                # draws while running, and the power curve behind it so a solver that
+                # follows the store can work it out from the temperature it plans
+                # (loads.power_curve). Absent for an appliance at its rating.
+                "power_w": _padded_series(demand.power_w, slots),
+                "power_curve": _padded_curve(demand.power_curve, slots),
                 "value_eur_per_wh": self._value_of(item),
                 "feasible": _padded(demand.feasible, slots),
                 # Per slot, what a Wh is worth against the best slot; the demand above

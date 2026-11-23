@@ -29,6 +29,14 @@ from .base import KIND_CONTINGENT, BaseDemandModel, EnergyDemand
 from .calibration import IDLE_POWER_W, ThermalCalibrator
 from .cover_habit import OBSERVED_HOURS, CoverHabit
 from ..modulation import ModulationError, factor_at, parse_modulation
+from ..power_curve import (
+    PowerCurveError,
+    PowerCurveLearner,
+    curve_from_config,
+    factor_table,
+    guess_store_c,
+    parse_power_curve,
+)
 from .thermal_physics import (
     WH_PER_M3_PER_K,
     cop_at,
@@ -84,6 +92,15 @@ def _as_float(value, default=None):
         return float(str(value).strip().split()[0])
     except (ValueError, IndexError, AttributeError):
         return default
+
+
+def _as_bool(value, default=True):
+    """A config flag that may arrive as a string."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off")
+    return bool(value)
 
 
 def _round_or_none(value, digits=1):
@@ -146,6 +163,7 @@ class ThermalStorageModel(BaseDemandModel):
         # a reset starts again under the same rules rather than the pool's.
         self.calibration_options = dict(calibration or {})
         self.calibrator = self._new_calibrator()
+        self.power_learner = self._new_power_learner()
         self.cover_habit = CoverHabit()
         # The last definite reading of the circuit sensor, and when it was taken.
         self._circuit_off = None
@@ -166,17 +184,31 @@ class ThermalStorageModel(BaseDemandModel):
         calibrator.cop_factor = self._modulation_factor()
         return calibrator
 
+    def _new_power_learner(self):
+        return PowerCurveLearner(
+            self.configured_power_curve,
+            idle_power_w=self.standby_threshold_w or IDLE_POWER_W,
+            learn=self.power_curve_learning,
+        )
+
     def _modulation_factor(self):
         """
         The COP factor by electrical power, for the calibrator - or None.
 
-        Only where the planner applies the curve too (a minimum power is set): the
-        level the calibrator learns is the COP at factor 1.0, and the planner scales it.
+        Only where the planner applies the curve too (the power follows a power curve):
+        the level the calibrator learns is the COP at factor 1.0, and the planner
+        scales it by the factor at each slot's power.
         """
-        if not self.modulation or self.min_power_w <= 0:
+        if not self.modulation or not self.power_curve_active:
             return None
         points = list(self.modulation)
         return lambda power_w: factor_at(points, power_w)
+
+    def power_curve(self):
+        """The power curve in force, or None for an appliance at its rated power."""
+        if not self.power_curve_active:
+            return None
+        return self.power_learner.curve()
 
     def _apply_config(self, config):
         """
@@ -203,6 +235,24 @@ class ThermalStorageModel(BaseDemandModel):
                 "ACTION REQUIRED", config.get("id", "?"), exc,
             )
             self.modulation = []
+        # What such a pump draws is its controller's choice, not the plan's: the plan
+        # switches it on and off, and while on it draws what the power curve says for
+        # that slot's air and store temperature (loads.power_curve). Active for a
+        # modulating appliance (a minimum power) or wherever a curve is configured.
+        try:
+            terms = parse_power_curve(config.get("power_curve", ""))
+        except PowerCurveError as exc:
+            logger.warning(
+                "[LOADS] '%s': power_curve ignored (%s) | Config: #managed-loads | "
+                "ACTION REQUIRED", config.get("id", "?"), exc,
+            )
+            terms = {}
+        self.power_curve_active = bool(terms) or self.min_power_w > 0
+        self.power_curve_learning = _as_bool(config.get("power_curve_learning", True))
+        self.configured_power_curve = curve_from_config(
+            terms, self.rated_power_w, self.min_power_w,
+            default_ref_c=_as_float(config.get("target_temp"), 20.0),
+        )
         self.deadband_k = max(0.0, float(config.get("deadband_k", 0.5) or 0.0))
         self.cover_loss_factor = float(config.get("cover_loss_factor", 1.0) or 1.0)
         # The permanent draw of the appliance's own systems - circulation pumps,
@@ -243,10 +293,17 @@ class ThermalStorageModel(BaseDemandModel):
         # is invalidated by it, so the fit carries over.
         self.calibrator.set_idle_threshold(self.standby_threshold_w)
         self.calibrator.cop_factor = self._modulation_factor()
+        # A new configured curve is a new prior; the samples behind the fit stay.
+        self.power_learner.set_prior(
+            self.configured_power_curve,
+            idle_power_w=self.standby_threshold_w or IDLE_POWER_W,
+            learn=self.power_curve_learning,
+        )
 
     def reset_calibration(self):
         """Discard what has been learned and start again from the configured values."""
         self.calibrator = self._new_calibrator()
+        self.power_learner = self._new_power_learner()
         self.cover_habit.reset()
 
     # -- configuration helpers ----------------------------------------------------------
@@ -505,14 +562,20 @@ class ThermalStorageModel(BaseDemandModel):
                 and not circuit_off):
             store = self.thermal_store(ctx, current, target, cover)
 
+        power_w, power_curve = self.power_plan(ctx, current, target)
+        power_now = (
+            power_w[ctx.current_slot]
+            if power_w and 0 <= ctx.current_slot < len(power_w) else self.rated_power_w
+        )
+
         return EnergyDemand(
             kind=self.kind,
             total_wh=total_wh,
             feasible=feasible,
             feasible_reason=feasible_reason,
             max_power_w=self.rated_power_w,
-            min_power_w=self.min_power_w,
-            modulation=list(self.modulation) if self.min_power_w > 0 else [],
+            power_w=power_w,
+            power_curve=power_curve,
             efficiency=efficiency,
             store=store,
             deadline_slot=deadline_slot,
@@ -570,10 +633,53 @@ class ThermalStorageModel(BaseDemandModel):
                 "horizon_hours": round(
                     max(0, ctx.slot_count - ctx.current_slot) * ctx.hours_per_slot(), 1
                 ),
-                "electrical_power_w": self.rated_power_w,
-                "thermal_power_w": round(self.rated_power_w * mean_cop),
+                # What it draws while running now: the power curve's figure for this
+                # slot where it has one, its rating otherwise.
+                "electrical_power_w": round(power_now, 1),
+                "thermal_power_w": round(
+                    power_now * mean_cop
+                    * (factor_at(self.modulation, power_now)
+                       if self.modulation and power_curve else 1.0)
+                ),
+                "power_curve": (
+                    {**self.power_learner.state(), "power_now_w": round(power_now, 1)}
+                    if power_curve else None
+                ),
             },
         )
+
+    def power_plan(self, ctx, current, target):
+        """
+        Per slot, what the appliance draws while running, and the formula behind it.
+
+        ``([], None)`` for an appliance at its rated power. With a power curve every
+        slot gets the curve's figure at that slot's air and at a first guess of the
+        store's temperature - where it is now, settling back to target over the next
+        hours. A solver following the store replaces the guess with the temperature it
+        plans, which is why the formula goes along too: the base per slot (everything
+        but the store term, the air already in it), the store term, the bounds, and
+        the modulation COP factor across the range. Lists are in EOS slot space.
+        """
+        curve = self.power_curve()
+        if curve is None:
+            return [], None
+        hours = ctx.hours_per_slot()
+        airs, powers = [], []
+        for index in range(ctx.slot_count):
+            air = self._cop_air_at(ctx, index)
+            air = float(air) if air is not None else 0.0
+            ahead = max(0, index - ctx.current_slot) * hours
+            airs.append(air)
+            powers.append(round(curve.at(air, guess_store_c(current, target, ahead)), 1))
+        solver = {
+            "base_w": [round(curve.base_w + curve.air_w_per_k * air, 1) for air in airs],
+            "store_w_per_k": round(curve.store_w_per_k, 3),
+            "ref_c": round(curve.ref_c, 3),
+            "min_w": round(curve.min_w, 1),
+            "max_w": round(curve.max_w, 1),
+            "cop_factor": factor_table(self.modulation, curve.min_w, curve.max_w),
+        }
+        return powers, solver
 
     def thermal_store(self, ctx, current, target, cover):
         """
@@ -745,6 +851,9 @@ class ThermalStorageModel(BaseDemandModel):
                 self._cop_air_at(ctx, index), self.calibrator.cop_nominal,
                 self.calibrator.air_coefficient,
             )
+            if electrical_wh > 0 and hours > 0 and self._modulation_factor() is not None:
+                # The COP the planner gave this slot: scaled by the factor at its power.
+                gained *= factor_at(self.modulation, electrical_wh / hours)
             gained -= loss_power_w(
                 self.calibrator.loss_coefficient, self.surface_m2, temperature, ambient,
                 cover[index] if isinstance(cover, list) else cover,
@@ -781,7 +890,8 @@ class ThermalStorageModel(BaseDemandModel):
         if not isinstance(sample, dict) or "timestamp" not in sample:
             return False
         self._observe_cover(sample)
-        return self.calibrator.observe(sample)
+        learned = self.power_learner.observe(sample) if self.power_curve_active else False
+        return bool(self.calibrator.observe(sample) or learned)
 
     def _observe_cover(self, sample):
         """Note whether the store was covered, for the per-hour pattern."""
@@ -804,6 +914,8 @@ class ThermalStorageModel(BaseDemandModel):
         for sample in rows:
             if isinstance(sample, dict):
                 self._observe_cover(sample)
+        if self.power_curve_active:
+            self.power_learner.observe_series(rows)
         return self.calibrator.observe_series(rows)
 
     def status(self):
@@ -813,6 +925,9 @@ class ThermalStorageModel(BaseDemandModel):
             "volume_m3": self.volume_m3,
             "surface_m2": self.surface_m2,
             "rated_power_w": self.rated_power_w,
+            "power_curve": (
+                self.power_learner.state() if self.power_curve_active else None
+            ),
             "deadband_k": self.deadband_k,
             "standby_threshold_w": self.standby_threshold_w,
         })

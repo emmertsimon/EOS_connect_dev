@@ -525,7 +525,9 @@ class ManagedLoad:
     def _plan_only(self, demand, ctx, budget_wh):
         """The placement, without settling the gate on it."""
         options = self._resolved_options(ctx)
-        self.last_slot_capacity_wh = demand.max_power_w * ctx.hours_per_slot()
+        self.last_slot_capacity_wh = (
+            demand.power_at(ctx.current_slot) * ctx.hours_per_slot()
+        )
         # Whichever planner ends up placing this load, the summary answers the same
         # question and needs the same footing.
         self._remember_affordable(ctx)
@@ -565,9 +567,11 @@ class ManagedLoad:
         fresh start, so the residue held the gate open indefinitely - on a live heat
         pump, a whole night of heating the plan itself had put at 0 W.
 
-        Half of what the appliance draws in the time left of the slot: its minimum
-        for a modulating one, its rating otherwise, at 5 % - a fraction of a slot is a
-        plan for an on/off appliance, a tenth of a watt is not. Never below 1 Wh.
+        Half of what the appliance draws in the time left of the slot where its draw
+        follows a power curve - the plan switches it, so a planned slot carries the
+        curve's power for the whole remainder - and 5 % of its rating otherwise: a
+        fraction of a slot is a plan for an on/off appliance, a tenth of a watt is
+        not. Never below 1 Wh.
         """
         hours_left = ctx.hours_per_slot()
         anchor = getattr(ctx, "anchor", None)
@@ -577,11 +581,10 @@ class ManagedLoad:
             )
             hours_left = max(60.0, (slot_end - ctx.now).total_seconds()) / 3600.0
             hours_left = min(hours_left, ctx.hours_per_slot())
-        floor_w = float(getattr(demand, "min_power_w", 0.0) or 0.0)
-        share = 0.5
-        if floor_w <= 0:
-            floor_w = float(demand.max_power_w or 0.0)
-            share = 0.05
+        if getattr(demand, "power_w", None):
+            floor_w, share = float(demand.power_at(ctx.current_slot)), 0.5
+        else:
+            floor_w, share = float(demand.max_power_w or 0.0), 0.05
         return max(RUN_THRESHOLD_MIN_WH, share * floor_w * hours_left)
 
     def _mask_current_slot(self, demand, ctx, scheduled=False):
