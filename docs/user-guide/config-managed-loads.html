@@ -845,6 +845,33 @@
                         one and a half times it only 0.2&nbsp;K: a model that thinks the house is light
                         expects it to react faster than it does.</p>
 
+                    <h3 id="managed-loads-house-learning">How a house learns its capacity and losses</h3>
+                    <p>The calibration above learns from windows, each a stretch over which the
+                        temperature moved. For a house with floor heating that does not work: the
+                        screed holds a run's heat back for hours, so a window during a run sees less
+                        warming than the heat went in, and the window after it sees warming with the
+                        heat pump off. On the measured house the windows explained 8&nbsp;% of the heat
+                        flow, the loss stayed at its starting value, and the stored heat was never
+                        learned at all.</p>
+                    <p>So a house learns four numbers from how well it <em>forecast</em> instead:
+                        the stored heat per kelvin, the loss per kelvin, the heat per watt of sun and
+                        the heat the house makes for itself (people, appliances, a hot water tank).
+                        From every hour of the last two weeks the model is run twelve hours ahead on
+                        the heat that was actually delivered, and the numbers that bring those
+                        forecasts closest to what the rooms then did are kept &mdash; but only if they
+                        forecast the last two days, held back while fitting, better than the numbers
+                        in use. This needs a heat meter (<code>heat_sensor</code>; without one the heat
+                        is estimated from the electrical power and the COP) and runs twice a day in
+                        the background, never in the optimizer's way.</p>
+                    <p>On the measured house it found 38&nbsp;kWh/K and 105&nbsp;W/K where the starting
+                        values had 21&nbsp;kWh/K and 51&nbsp;W/K: twelve hours ahead the forecast was
+                        0.17&nbsp;K out instead of 0.44&nbsp;K, and six hours into a cold morning no longer
+                        0.38&nbsp;K too warm but 0.13&nbsp;K. The values in use, where they came from and the last attempt with its
+                        scores are in the load's <code>model</code>: <code>capacity_wh_per_k</code>,
+                        <code>capacity_source</code>, <code>effective_loss_coefficient</code>,
+                        <code>effective_solar_gain</code>, <code>internal_gain_w</code> and
+                        <code>house_fit</code>.</p>
+
                     <h3 id="managed-loads-cop">The efficiency of a heat pump</h3>
                     <p>A pool learns its heat pump's efficiency from how fast the water warms. A
                         house cannot, and the reason is worth knowing: a heat pump planned around
