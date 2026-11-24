@@ -9,7 +9,10 @@ Wärmepumpe (`feature/modulating-heat-pump`, Teillast-COP) und der Leistungskurv
 gelernten Formel über Außen- und Haustemperatur) und dem Soft-/Hard-Limit für Speicher
 (`feature/dhw-soft-hard-limit`: unter `soft_limit_temp_c` eine Ladung im nächsten Fenster trotz
 Preisgrenze, unter `frost_protection_temp_c` sofort; mit 0,3 K Hysterese `limit_hysteresis_k`
-und Überbrückung eines bis 15 min ausgefallenen Temperatursensors) obendrauf.
+und Überbrückung eines bis 15 min ausgefallenen Temperatursensors) und dem Hauslernen
+(`feature/learn-house-capacity`: das Haus lernt Speicherkapazität, Wärmeverlust, Sonnen- und
+Eigenwärme aus seinen 12-h-Vorhersagen, übernommen nur wenn sie die letzten 2 Tage besser
+vorhergesagt hätten) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).

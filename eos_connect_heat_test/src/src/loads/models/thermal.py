@@ -39,9 +39,7 @@ from ..power_curve import (
     parse_power_curve,
 )
 from .thermal_physics import (
-    WH_PER_M3_PER_K,
     cop_at,
-    energy_to_raise_wh,
     loss_power_w,
     thermal_to_electrical_wh,
 )
@@ -199,6 +197,7 @@ class ThermalStorageModel(BaseDemandModel):
             **self.calibration_options,
         )
         calibrator.cop_factor = self._modulation_factor()
+        calibrator.label = self.id
         return calibrator
 
     def _new_power_learner(self):
@@ -596,7 +595,12 @@ class ThermalStorageModel(BaseDemandModel):
                 + int(round(float(self.deadline_hours) * 3600 / ctx.time_frame_base)),
             )
 
-        heat_up_wh = energy_to_raise_wh(self.volume_m3, target - current)
+        # The capacity a house has learned (calibration.capacity_wh_per_k), else the
+        # configured volume's.
+        heat_up_wh = (
+            max(0.0, target - current) * self.calibrator.capacity_wh_per_k()
+            if self.volume_m3 > 0 else 0.0
+        )
         losses_wh, mean_cop = self._horizon_losses(
             ctx, target, cover, feasible, until=deadline_slot
         )
@@ -807,19 +811,23 @@ class ThermalStorageModel(BaseDemandModel):
         be banked at the top. Lists are in EOS slot space, from local midnight.
         """
         solar = ctx.solar_wh or []
-        gain = self.calibrator.solar_gain
+        gain = self.calibrator.effective_solar_gain()
+        coefficient = self.calibrator.effective_loss_coefficient()
+        # The heat a learned house makes for itself, per slot.
+        own_wh = self.calibrator.internal_gain_w() * ctx.hours_per_slot()
         loss, ambient, gains = [], [], []
         for index in range(ctx.slot_count):
             air = self._ambient_at(ctx, index)
             ambient.append(air if air is not None else 0.0)
             factor = cover[index] if isinstance(cover, list) else cover
-            loss.append(self.calibrator.loss_coefficient * self.surface_m2 * factor)
+            loss.append(coefficient * self.surface_m2 * factor)
             gains.append(
-                gain * max(0.0, float(solar[index]))
-                if gain > 0 and index < len(solar) else 0.0
+                (gain * max(0.0, float(solar[index]))
+                 if gain > 0 and index < len(solar) else 0.0)
+                + own_wh
             )
         return {
-            "capacity_wh_per_k": WH_PER_M3_PER_K * self.volume_m3,
+            "capacity_wh_per_k": self.calibrator.capacity_wh_per_k(),
             "loss_w_per_k": loss,
             "ambient_c": ambient,
             "cop": self.cop_series(ctx),
@@ -892,7 +900,9 @@ class ThermalStorageModel(BaseDemandModel):
         """
         hours = ctx.hours_per_slot()
         solar = ctx.solar_wh or []
-        gain = self.calibrator.solar_gain
+        gain = self.calibrator.effective_solar_gain()
+        coefficient = self.calibrator.effective_loss_coefficient()
+        own_wh = self.calibrator.internal_gain_w() * hours
         # A store with a deadline is asked to be at target *by* then, not held there
         # for two days. Integrating to the end of the horizon regardless asked a sauna
         # for 177 kWh of standing loss - 29 hours of running in a 42 hour horizon -
@@ -906,9 +916,11 @@ class ThermalStorageModel(BaseDemandModel):
             if ambient is None:
                 continue
             losses += loss_power_w(
-                self.calibrator.loss_coefficient, self.surface_m2, target, ambient,
+                coefficient, self.surface_m2, target, ambient,
                 cover[index] if isinstance(cover, list) else cover,
             ) * hours
+            # The heat a learned house makes for itself is netted off like the sun.
+            losses -= own_wh
             if gain > 0 and index < len(solar):
                 # solar_wh is energy per slot; the gain was fitted against power.
                 losses -= gain * max(0.0, float(solar[index]))
@@ -946,8 +958,10 @@ class ThermalStorageModel(BaseDemandModel):
         hours = ctx.hours_per_slot()
         cover = self.cover_series(ctx, self.cover_factor(ctx.readings))
         solar = ctx.solar_wh or []
-        gain = self.calibrator.solar_gain
-        capacity_wh_per_k = WH_PER_M3_PER_K * self.volume_m3
+        gain = self.calibrator.effective_solar_gain()
+        coefficient = self.calibrator.effective_loss_coefficient()
+        own_wh = self.calibrator.internal_gain_w() * hours
+        capacity_wh_per_k = self.calibrator.capacity_wh_per_k()
 
         temperature = float(start_c)
         projected = []
@@ -969,9 +983,10 @@ class ThermalStorageModel(BaseDemandModel):
                 # The COP the planner gave this slot: scaled by the factor at its power.
                 gained *= factor_at(self.modulation, electrical_wh / hours)
             gained -= loss_power_w(
-                self.calibrator.loss_coefficient, self.surface_m2, temperature, ambient,
+                coefficient, self.surface_m2, temperature, ambient,
                 cover[index] if isinstance(cover, list) else cover,
             ) * hours
+            gained += own_wh
             if gain > 0 and index < len(solar):
                 gained += gain * max(0.0, float(solar[index]))
 
