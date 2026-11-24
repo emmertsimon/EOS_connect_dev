@@ -207,3 +207,158 @@ def test_a_record_without_an_efficiency_gives_the_solver_none():
     with _at(backend, 6, 0):
         configs = backend._managed_load_configs([record])
     assert configs[0].efficiency is None
+# -- one clock per run --------------------------------------------------------------------
+#
+# The quarter-aligned run is started so that it *finishes* on the boundary. If the way in
+# and the way out each read the clock, the way in lands in slot n and the way out in
+# n + 1, and everything the run returns comes back one slot late.
+
+
+class _MovingClock:
+    """A clock that has crossed a quarter-hour boundary by the second time it is read."""
+
+    def __init__(self, *moments):
+        self.moments = list(moments)
+
+    def patch(self):
+        moments = self.moments
+
+        class _Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moments.pop(0) if len(moments) > 1 else moments[0]
+
+        return patch(
+            "src.interfaces.optimization_backends.optimization_backend_evopt.datetime",
+            _Clock,
+        )
+
+
+def _straddling_clock():
+    return _MovingClock(
+        datetime(2026, 11, 19, 12, 44, 58, tzinfo=BERLIN),   # slot 50, run starts
+        datetime(2026, 11, 19, 12, 45, 0, tzinfo=BERLIN),    # slot 51, run returns
+    )
+
+
+def test_a_run_that_crosses_a_boundary_shifts_without_one_clock(backend):
+    """The defect itself: two clock readings, one slot apart."""
+    mask = [False] * 192
+    mask[52] = True                   # 13:00
+    with _straddling_clock().patch():
+        window = backend.to_solver_slots(mask, fill=False)
+        back = backend.from_solver_slots(window, fill=False)
+    assert back.index(True) == 53     # one slot late
+
+
+def test_one_clock_per_run_keeps_a_straddling_run_on_its_slot(backend):
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+        pinned_run_clock,
+    )
+
+    mask = [False] * 192
+    mask[52] = True
+
+    @one_clock_per_run
+    def run(self):
+        window = self.to_solver_slots(mask, fill=False)
+        return self.from_solver_slots(window, fill=False)
+
+    with _straddling_clock().patch():
+        back = run(backend)
+    assert back.index(True) == 52
+    assert pinned_run_clock(backend) is None   # released once the run is over
+
+
+def test_the_clock_is_released_when_the_run_fails(backend):
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+        pinned_run_clock,
+    )
+
+    @one_clock_per_run
+    def run(self):
+        raise RuntimeError("solver gone")
+
+    with _at(backend, 12, 44), pytest.raises(RuntimeError):
+        run(backend)
+    assert pinned_run_clock(backend) is None
+
+
+def test_a_nested_run_keeps_the_outer_reading(backend):
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+    )
+
+    @one_clock_per_run
+    def inner(self):
+        return self._calculate_time_parameters()["current_slot"]
+
+    @one_clock_per_run
+    def outer(self):
+        first = self._calculate_time_parameters()["current_slot"]
+        return first, inner(self)
+
+    with _straddling_clock().patch():
+        assert outer(backend) == (50, 50)
+
+
+def test_a_run_on_another_thread_takes_its_own_reading(backend):
+    """A concurrent run must neither borrow nor release this run's reading."""
+    import threading
+
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+        pinned_run_clock,
+    )
+
+    seen = {}
+
+    @one_clock_per_run
+    def other(self):
+        seen["other"] = pinned_run_clock(self)
+
+    @one_clock_per_run
+    def run(self):
+        mine = pinned_run_clock(self)
+        worker = threading.Thread(target=other, args=(self,))
+        worker.start()
+        worker.join()
+        return mine, pinned_run_clock(self)
+
+    with _straddling_clock().patch():
+        before, after = run(backend)
+    assert before == after                       # untouched by the other thread
+    assert seen["other"] is not None and seen["other"] != before
+    assert pinned_run_clock(backend) is None
+
+
+def test_the_previous_plan_is_lined_up_on_the_runs_reading():
+    """
+    A run that starts at 23:59:58 and reaches _plan_start after midnight must still
+    start the plan at 23:45 of the day it began: the slot comes from the run's reading,
+    and so must the midnight it counts from.
+    """
+    from src.interfaces.optimization_backends.optimization_backend_evopt import (
+        one_clock_per_run,
+    )
+    from src.interfaces.optimization_backends.optimization_backend_local_evopt import (
+        LocalEVOptBackend,
+    )
+
+    backend = LocalEVOptBackend.__new__(LocalEVOptBackend)
+    backend.time_zone = BERLIN
+    backend.time_frame_base = 900
+    clock = _MovingClock(
+        datetime(2026, 11, 19, 23, 59, 58, tzinfo=BERLIN),
+        datetime(2026, 11, 20, 0, 0, 0, tzinfo=BERLIN),
+    )
+
+    @one_clock_per_run
+    def run(self):
+        return self._plan_start()
+
+    with clock.patch():
+        start = run(backend)
+    assert start == datetime(2026, 11, 19, 23, 45, tzinfo=BERLIN)
