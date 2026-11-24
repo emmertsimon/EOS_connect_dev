@@ -45,11 +45,13 @@ import logging
 import math
 from collections import deque
 
+from . import house_fit
 from .thermal_physics import (
     COP_MAX,
     COP_MIN,
     COP_REFERENCE_AMBIENT_C,
     WH_PER_M3_PER_K,
+    cop_at,
 )
 
 logger = logging.getLogger("__main__")
@@ -176,6 +178,16 @@ LOSS_FIT_MIN_ROWS = 12
 # Share of the windows' heat flow a fitted loss has to explain to be kept. Measured on
 # a house with a metered COP: 6 % - the windows were noise, and the loss with them.
 LOSS_FIT_MIN_QUALITY = 0.3
+
+# A house learns its capacity, loss and free heat from how well it forecast instead
+# (loads.models.house_fit), from the raw samples rather than the windows: a fortnight
+# at the five-minute cadence, with room to spare.
+HOUSE_SAMPLE_LIMIT = 4500
+# How often that fit is tried. A tenth of a second each time, in the poll thread, never
+# in the optimizer's way; twice a day lets a cold snap show up by the next evening.
+HOUSE_REFIT_INTERVAL_HOURS = 12.0
+# What a learned house set holds.
+HOUSE_KEYS = ("capacity_wh_per_k", "loss_w_per_k", "solar_gain", "internal_gain_w")
 
 
 def _clamp(value, low, high):
@@ -321,7 +333,7 @@ class ThermalCalibrator:
                  air_coefficient=0.0, cover_loss_factor=1.0, idle_power_w=None,
                  loss_coefficient_min=LOSS_COEFFICIENT_MIN,
                  loss_coefficient_max=LOSS_COEFFICIENT_MAX,
-                 learn_cop=True, min_window_change_k=0.0):
+                 learn_cop=True, min_window_change_k=0.0, learn_capacity=False):
         self.volume_m3 = float(volume_m3 or 0.0)
         self.surface_m2 = float(surface_m2 or 0.0)
         # The plausibility band for the loss coefficient belongs to the kind of store,
@@ -343,6 +355,16 @@ class ThermalCalibrator:
         # the prediction was 0.37 K out on a real house, against 0.18 K with windows
         # that had to span 0.2 K.
         self.min_window_change_k = max(0.0, float(min_window_change_k or 0.0))
+        # Whether this store learns its capacity, loss and free heat from its own
+        # forecasts (loads.models.house_fit) - a house, whose windows cannot. The set in
+        # use, the last attempt with its scores, and when it was made.
+        self.learn_capacity = bool(learn_capacity)
+        self._house_samples = deque(maxlen=HOUSE_SAMPLE_LIMIT)
+        self.house = None
+        self.house_fit = None
+        self._house_fitted_at = None
+        # Who this is, for the log line a learned set earns.
+        self.label = "store"
         # Where the current COP came from: "configured", "fit" or "heat_meter".
         self.cop_source = "configured"
         # For a modulating heat pump: the COP factor at a given electrical power (see
@@ -424,6 +446,8 @@ class ThermalCalibrator:
         """
         if not self._usable(sample):
             return False
+        if self.learn_capacity:
+            self._house_samples.append(sample)
 
         closed = False
         if self._window and self._window_state_changed(self._window[-1], sample):
@@ -441,6 +465,8 @@ class ThermalCalibrator:
 
         if closed and refit:
             self.refit()
+        if refit and self._house_due(sample["timestamp"]):
+            closed = self.refit_house(sample["timestamp"]) or closed
         return closed
 
     def _window_state_changed(self, previous, current):
@@ -471,7 +497,107 @@ class ThermalCalibrator:
         produced = len(self._rows) - rows_before
         if produced:
             self.refit()
+        if self.learn_capacity and self._house_samples:
+            self.refit_house(self._house_samples[-1]["timestamp"])
         return produced
+
+    # -- the house --------------------------------------------------------------------
+
+    def _house_prior(self):
+        """The configured house - the centre the fit is pulled towards."""
+        return {
+            "capacity_wh_per_k": WH_PER_M3_PER_K * self.volume_m3,
+            "loss_w_per_k": self.configured_loss_coefficient * self.surface_m2,
+            "solar_gain": self.solar_gain,
+            "internal_gain_w": 0.0,
+        }
+
+    def _house_due(self, now):
+        if not self.learn_capacity:
+            return False
+        if self._house_fitted_at is None:
+            return True
+        try:
+            hours = (now - self._house_fitted_at).total_seconds() / 3600.0
+        except (TypeError, AttributeError):
+            return True
+        return hours >= HOUSE_REFIT_INTERVAL_HOURS or hours < 0
+
+    def _cop_now(self, air_c):
+        """The COP at an air temperature, for slots the heat meter left unread."""
+        return cop_at(float(air_c), self.cop_nominal, self.air_coefficient)
+
+    def refit_house(self, now=None):
+        """
+        Try a new capacity, loss and free heat on the recorded samples.
+
+        Adopted only when it forecast the held-back days better than the set in use
+        (`house_fit.fit_house`); either way the attempt and its scores are kept for the
+        API. Returns True when a new set was adopted.
+        """
+        if not self.learn_capacity or self.volume_m3 <= 0 or self.surface_m2 <= 0:
+            return False
+        if now is None and self._house_samples:
+            now = self._house_samples[-1]["timestamp"]
+        self._house_fitted_at = now
+        prior = self._house_prior()
+        try:
+            result = house_fit.fit_house(
+                list(self._house_samples), prior,
+                current=self.house or prior, cop=self._cop_now,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("[LOADS] '%s': house fit failed - keeping the values in use",
+                           self.label, exc_info=True)
+            return False
+        if result is None:
+            return False
+        result["fitted_at"] = now.isoformat() if hasattr(now, "isoformat") else None
+        self.house_fit = result
+        if not result.get("accepted"):
+            log = logger.info if "holdout_rms_k" in result else logger.debug
+            log(
+                "[LOADS] '%s': house values kept (%s) - 12 h forecast error %s K "
+                "learned vs %s K in use",
+                self.label, result.get("reason"), result.get("holdout_rms_k"),
+                result.get("holdout_rms_in_use_k"),
+            )
+            return False
+        self.house = {key: float(result[key]) for key in HOUSE_KEYS}
+        logger.info(
+            "[LOADS] '%s': house learned - capacity %.1f kWh/K, loss %.0f W/K, "
+            "sun %.2f, own heat %.0f W; forecast error over the last two days "
+            "%.3f K (was %.3f K)",
+            self.label, self.house["capacity_wh_per_k"] / 1000.0,
+            self.house["loss_w_per_k"], self.house["solar_gain"],
+            self.house["internal_gain_w"], result.get("holdout_rms_k") or 0.0,
+            result.get("holdout_rms_in_use_k") or 0.0,
+        )
+        return True
+
+    def capacity_wh_per_k(self):
+        """Heat stored per kelvin: learned for a house that has, else configured."""
+        if self.house:
+            return self.house["capacity_wh_per_k"]
+        return WH_PER_M3_PER_K * self.volume_m3
+
+    def effective_loss_coefficient(self):
+        """The loss per square metre and kelvin the plan uses."""
+        if self.house and self.surface_m2 > 0:
+            return self.house["loss_w_per_k"] / self.surface_m2
+        return self.loss_coefficient
+
+    def effective_solar_gain(self):
+        """Thermal watts per watt of the irradiance proxy the plan uses."""
+        if self.house:
+            return self.house["solar_gain"]
+        return self.solar_gain
+
+    def internal_gain_w(self):
+        """Heat the store makes for itself, in watts. Only a learned house has any."""
+        if self.house:
+            return self.house["internal_gain_w"]
+        return 0.0
 
     # -- windowing ----------------------------------------------------------------------
 
@@ -1043,6 +1169,19 @@ class ThermalCalibrator:
             "signal_w": self.signal_w,
             "fit_quality": self.fit_quality(),
             "cop_source": self.cop_source,
+            **(self._house_state() if self.learn_capacity else {}),
+        }
+
+    def _house_state(self):
+        """What the house fit adds: the values in use, where they came from, the try."""
+        return {
+            "capacity_wh_per_k": round(self.capacity_wh_per_k(), 1),
+            "capacity_source": "house_fit" if self.house else "configured",
+            "effective_loss_coefficient": round(self.effective_loss_coefficient(), 4),
+            "effective_solar_gain": round(self.effective_solar_gain(), 4),
+            "internal_gain_w": round(self.internal_gain_w(), 1),
+            "house": dict(self.house) if self.house else None,
+            "house_fit": dict(self.house_fit) if self.house_fit else None,
         }
 
     def restore(self, state):
@@ -1078,3 +1217,11 @@ class ThermalCalibrator:
         restored = state.get("confidence")
         if isinstance(restored, (int, float)):
             self._restored_confidence = _clamp(float(restored), 0.0, 1.0)
+        house = state.get("house")
+        if (self.learn_capacity and isinstance(house, dict)
+                and self.volume_m3 > 0 and self.surface_m2 > 0
+                and house_fit.plausible(house, self._house_prior())):
+            self.house = {key: float(house.get(key, 0.0) or 0.0) for key in HOUSE_KEYS}
+        last = state.get("house_fit")
+        if self.learn_capacity and isinstance(last, dict):
+            self.house_fit = dict(last)

@@ -203,6 +203,11 @@ PRESETS = {
             # A window has to span a real change of the house, not a flicker of one
             # room: 0.2 K, against the three sensor ticks that serve a pool.
             "min_window_change_k": 0.2,
+            # And the windows cannot learn a house at all: the screed holds a run's heat
+            # back for hours, so they explained 8 % of the heat flow and the loss stayed
+            # at its guess, while the capacity was never learned in the first place. A
+            # house learns both from how well it forecast instead (house_fit).
+            "learn_capacity": True,
         },
         "defaults": {
             **building.DEFAULT_INPUTS,
