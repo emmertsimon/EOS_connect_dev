@@ -88,6 +88,12 @@ LOSS_COEFFICIENT_MAX = 200.0
 
 # A linear COP slope beyond this is a fitting artefact, not a compressor characteristic.
 AIR_COEFFICIENT_LIMIT = 0.06
+# Nor does a heat pump get worse as the air it draws from warms. A falling slope is the
+# windows mixing in something the air did not cause - a hotter tank in the afternoon,
+# a defrost, a tap left running - and planned on, it moves work into the cold hours,
+# exactly the wrong way: a hot-water tank fitted on such windows would be heated at
+# night. The floor is flat: no slope at all.
+AIR_COEFFICIENT_MIN = 0.0
 
 # A cover cannot make a store lose heat faster than no cover, and no cover cuts losses
 # by more than this. Both ends are physical, not statistical: outside them the fit has
@@ -139,6 +145,17 @@ HEAT_METER_MIN_ROWS = 3
 # at its configured value and the fit says the slope was not identified.
 COP_FIT_MIN_SPAN_K = 3.0
 
+# What the configured slope is worth in the heat-meter fit, as windows spread evenly
+# over a reference range of air temperatures. The windows pin a slope only as well as
+# their air temperatures spread, and a prior worth a fixed *count* of windows does not
+# know that: a few kelvin of autumn and a couple of dozen windows can fit a slope
+# twice the real one, and extrapolated to a frost that plans cold nights as markedly
+# dearer than they are. Weighed by spread instead, the prior carries a narrow autumn
+# and fades once a winter's range is in the history - at 15 K of spread and a few
+# dozen windows the data has over 90 % of the say.
+COP_SLOPE_PRIOR_WINDOWS = 4.0
+COP_SLOPE_REFERENCE_SPAN_K = 15.0
+
 # How quickly old rows stop counting. A cover left off, or a season turning, should show
 # up within a couple of weeks rather than being averaged away forever.
 WEIGHT_HALF_LIFE_HOURS = 7 * 24.0
@@ -166,6 +183,21 @@ LOSS_FIT_MIN_QUALITY = 0.3
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+_WARNED_FALLING_AIR = set()
+
+
+def _warn_falling_air_coefficient(value):
+    """Say once per value that a configured falling COP slope is used as flat."""
+    if value in _WARNED_FALLING_AIR:
+        return
+    _WARNED_FALLING_AIR.add(value)
+    logger.warning(
+        "[LOADS] cop_air_coeff %.4f is below 0 - a heat pump does not get worse as its "
+        "air warms, so it is used as 0. Set it to 0 or above to silence this; the web "
+        "form no longer accepts a negative value.", value,
+    )
 
 
 def _rms_error(theta, weights, design, targets):
@@ -201,17 +233,25 @@ def _explained(theta, weights, design, targets):
     return max(0.0, 1.0 - _rms_error(theta, weights, design, targets) / signal)
 
 
-def _settled_estimate(solve, pinned, fit):
+def _settled_estimate(solve, pinned, prior_scaled, fit):
     """
     The refit's estimate after the rules that re-solve it, and whether the loss in it
     was fitted: ``(estimate, loss_identified)``, ``(None, False)`` when singular.
 
-    *solve* takes a list of pinned columns; *pinned* is the refit's own and may be
-    changed here; *fit* is ``(weights, design, targets)``, one entry per window.
+    *solve* takes a list of pinned columns; *pinned* and *prior_scaled* are the
+    refit's own and may be changed here; *fit* is ``(weights, design, targets)``,
+    one entry per window.
     """
     if len(fit[0]) < LOSS_FIT_MIN_ROWS:
         pinned[2] = pinned[3] = True
     estimate = solve(pinned)
+    if estimate is not None and estimate[1] < 0 and not pinned[1]:
+        # A falling COP slope is not a heat pump (AIR_COEFFICIENT_MIN). Re-solve with
+        # it held flat rather than clipping it afterwards, so the intercept takes back
+        # the level the slope had been carrying instead of losing it.
+        prior_scaled[1] = 0.0
+        pinned[1] = True
+        estimate = solve(pinned) or estimate
     if estimate is None:
         return None, False
     loss_free = not (pinned[2] and pinned[3])
@@ -364,8 +404,11 @@ class ThermalCalibrator:
             float(loss_coefficient or 25.0), self.loss_min, self.loss_max
         )
         self.configured_cop_nominal = _clamp(float(cop_nominal or 4.0), COP_MIN, COP_MAX)
+        configured_air = float(air_coefficient or 0.0)
+        if configured_air < AIR_COEFFICIENT_MIN:
+            _warn_falling_air_coefficient(configured_air)
         self.configured_air_coefficient = _clamp(
-            float(air_coefficient or 0.0), -AIR_COEFFICIENT_LIMIT, AIR_COEFFICIENT_LIMIT
+            configured_air, AIR_COEFFICIENT_MIN, AIR_COEFFICIENT_LIMIT
         )
         self.configured_cover_loss_factor = _clamp(
             float(cover_loss_factor or 1.0), COVER_FACTOR_MIN, 1.0
@@ -789,7 +832,7 @@ class ThermalCalibrator:
             ]
 
         estimate, self.loss_identified = _settled_estimate(
-            solve, pinned, (weights, design, targets)
+            solve, pinned, prior_scaled, (weights, design, targets)
         )
         if estimate is None:
             logger.debug("[LOADS] calibration fit is singular - keeping the last estimate")
@@ -807,10 +850,11 @@ class ThermalCalibrator:
 
         Heat out over electricity in, per running window, regressed on the air
         temperature. The level is a direct measurement and needs no prior; the slope is
-        pulled towards the configured one with the same weight as in the main fit, and
-        held at it outright until the history spans a range of air temperatures - the
-        same rule the main fit applies. Fitted around the mean temperature of the
-        windows, so the two do not trade off against each other. On a real house the
+        held at the configured one outright until the history spans a range of air
+        temperatures - the same rule the main fit applies - and pulled towards it after
+        that by a weight that falls as the spread grows (`COP_SLOPE_PRIOR_WINDOWS`).
+        Fitted around the mean temperature of the windows, so the two do not trade off
+        against each other. On a real house the
         level settled within two days (4.1 at 7 C against 4.0 after a fortnight) while
         the slope needed the first cold spell.
         """
@@ -833,8 +877,19 @@ class ThermalCalibrator:
         if max(temps) - min(temps) >= COP_FIT_MIN_SPAN_K:
             s_tt = sum(weight * (t - mean_t) ** 2 for t, _, weight in pairs)
             s_tc = sum(weight * (t - mean_t) * (cop - mean_cop) for t, cop, weight in pairs)
-            ridge = RIDGE_SAMPLES * (s_tt / len(pairs))
+            # The prior as COP_SLOPE_PRIOR_WINDOWS average windows spread evenly over
+            # the reference range (variance span^2 / 12), so its say shrinks as the
+            # history's own spread grows rather than only as the windows pile up.
+            ridge = (
+                COP_SLOPE_PRIOR_WINDOWS
+                * (total / len(pairs))
+                * COP_SLOPE_REFERENCE_SPAN_K ** 2 / 12.0
+            )
             slope = (s_tc + ridge * prior[1]) / (s_tt + ridge) if s_tt > 0 else prior[1]
+        # Never falling (AIR_COEFFICIENT_MIN). Floored here, before the line is anchored,
+        # so it still passes through the windows' mean: the measured level stays where
+        # the meter put it and only the extrapolation goes flat.
+        slope = max(0.0, slope)
         return mean_cop - slope * mean_t, slope
 
     def _prior(self):
@@ -871,7 +926,7 @@ class ThermalCalibrator:
         )
         air_coefficient = _clamp(
             slope / nominal if nominal > 0 else 0.0,
-            -AIR_COEFFICIENT_LIMIT, AIR_COEFFICIENT_LIMIT,
+            AIR_COEFFICIENT_MIN, AIR_COEFFICIENT_LIMIT,
         )
 
         self.loss_coefficient = loss
@@ -1013,8 +1068,10 @@ class ThermalCalibrator:
             self.solar_gain = float(solar)
         air = state.get("air_coefficient")
         if cop_restorable and isinstance(air, (int, float)):
+            # A falling slope persisted by an older build is floored on the way in; the
+            # history replayed straight after restore refits it properly.
             self.air_coefficient = _clamp(
-                float(air), -AIR_COEFFICIENT_LIMIT, AIR_COEFFICIENT_LIMIT
+                float(air), AIR_COEFFICIENT_MIN, AIR_COEFFICIENT_LIMIT
             )
         self._restored_loss_samples = max(0, int(state.get("loss_samples", 0) or 0))
         self._restored_cop_samples = max(0, int(state.get("cop_samples", 0) or 0))

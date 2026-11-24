@@ -816,6 +816,19 @@
                         losses and the sun learned from the hours describe how the rooms react,
                         not a daily energy balance, and a fortnight has too few days with both
                         heating and no sun to separate them.</p>
+                    <p data-level="expert">A heat meter pins the slope only as well as the air
+                        temperatures of its windows spread. The configured slope is therefore weighed
+                        as four windows spread evenly over 15&nbsp;K of air: a few degrees of autumn
+                        keep the slope close to the configured one, while a winter&rsquo;s range lets
+                        the meter set it. The level is measured around the windows&rsquo; mean and is
+                        not affected.</p>
+                    <p data-level="expert">The slope is never allowed below zero, fitted or
+                        configured, for any store: no heat pump gets worse as its air warms. A falling
+                        slope means the windows caught something the air did not cause &mdash; a
+                        hotter tank in the afternoon, tapping, a defrost &mdash; and planned on, it
+                        would move the heating into the coldest hours. It comes out flat instead, at
+                        the COP the meter measured, until the history shows the real rise. A negative
+                        <code>cop_air_coeff</code> from an older configuration is treated as 0.</p>
 
                     <h3 id="managed-loads-cover">The cover</h3>
                     <p>A pool cover is worth roughly two thirds of the heat loss, and it goes on
