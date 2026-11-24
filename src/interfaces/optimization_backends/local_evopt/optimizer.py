@@ -30,7 +30,9 @@ Modifications made for EOS_connect integration (adapted from main branch, ~2025-
 - Added 'emergency_reserve' discharging strategy (end-of-horizon SOC floor)
 - Added 'emergency_reserve' fields (s_reserve) to BatteryConfig and corresponding
   penalty variable/constraint in the MILP model
-- Added gapRel to OptimizerSettings and the CBC invocation (1% optimality gap)
+- Added gapRel to OptimizerSettings and the CBC invocation (1% optimality gap; the
+  terminal battery and store terms are measured from their start values so the gap
+  is not inflated by a constant)
 - Solver resolution probes CBC candidates with a real execve() and prefers the
   first that runs (system PATH, then pulp's bundled binary), because pulp's
   bundled x86_64 CBC is glibc-linked and cannot exec on Alpine/musl
@@ -815,9 +817,11 @@ class Optimizer:
             if starts is not None:
                 objective -= load.start_cost_eur * pulp.lpSum(starts)
 
-        # Final state of charge value [currency unit]
+        # Final state of charge value [currency unit], as the change from the start for
+        # the same reason as the store's (see `_store_objective`): a constant in the
+        # objective is slack in CBC's relative stopping gap.
         for i, bat in enumerate(self.batteries):
-            objective += self.variables['s'][i][-1] * bat.p_a
+            objective += (self.variables['s'][i][-1] - bat.s_initial) * bat.p_a
 
         # Demand rate charge
         if self.is_grid_demand_rate_active:
@@ -1263,7 +1267,14 @@ class Optimizer:
         terminal, penalty = self._store_values(load)
         lows = self.variables['tm_lo'][i]
         highs = self.variables['tm_hi'][i]
-        term = terminal * self.variables['tm_end'][i]
+        # Credited from where the store starts, not from 0 C. The same optimum - the
+        # two differ by a constant - but CBC's stopping gap is relative to the whole
+        # objective. A building credited for every kelvin above freezing adds a large
+        # constant to it (tens of euros for a house at room temperature), and 1 % of
+        # that is more than the price of an evening's household load: enough slack for
+        # the solver to stop at a plan that leaves a full battery unused and buys the
+        # evening from the grid instead.
+        term = terminal * (self.variables['tm_end'][i] - float(load.store.t_initial))
         term -= pulp.lpSum(
             penalty * self.time_series.dt[t] / 3600.0 * (lows[t] + highs[t])
             for t in self.time_steps
@@ -1624,10 +1635,11 @@ class Optimizer:
         is exactly what changes it -- so the residual lands straight on the
         measured ct/kWh.
 
-        Note the solved objective uses the level ``s[T-1] * p_a`` rather than a
-        delta.  That is equivalent for optimisation, since s_initial is a
-        constant and the two differ only by a constant, but the delta is the
-        right form for reporting what the plan actually cost.
+        The solved objective measures the battery the same way, as
+        ``(s[T-1] - s_initial) * p_a``: for the optimum it makes no difference
+        against the level ``s[T-1] * p_a``, since the two differ only by a
+        constant, but CBC's relative stopping gap is a fraction of the whole
+        objective, and a constant there is pure slack.
         """
         clean_objective = 0
         for t in self.time_steps:
