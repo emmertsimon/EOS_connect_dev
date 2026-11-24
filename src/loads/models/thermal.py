@@ -66,6 +66,13 @@ DEFAULT_CIRCUIT_OFF_STATES = ("off",)
 # every twenty must not flip the plan, so the last definite reading stands this long.
 CIRCUIT_UNKNOWN_STATES = ("", "unavailable", "unknown", "none")
 CIRCUIT_HOLD_SECONDS = 30 * 60
+# The same gateway drops the store's thermometer too. For this long the last reading
+# stands in, so a one-minute gap does not throw the plan away for a cycle.
+TEMPERATURE_HOLD_SECONDS = 15 * 60
+# A tank sitting on its soft limit reads 41.9 and 42.0 by turns. Once under a limit,
+# the store counts as under it until it is this far above, so the plan does not come
+# and go with the last digit of the sensor.
+DEFAULT_LIMIT_HYSTERESIS_K = 0.3
 
 # How a store is planned. By energy, the original way: an amount over the horizon,
 # placed by price. By temperature: the store itself, handed to a solver that can follow
@@ -171,6 +178,14 @@ class ThermalStorageModel(BaseDemandModel):
         self._circuit_off = None
         self._circuit_state = None
         self._circuit_seen_at = None
+        # The last readable store temperature, and when it was read - see
+        # `current_temperature`.
+        self._temp_last = None
+        self._temp_seen_at = None
+        # Whether the store went under its soft or hard limit and has not yet come
+        # back above it by the hysteresis - see `_limits`.
+        self._soft_latched = False
+        self._hard_latched = False
 
     def _new_calibrator(self):
         calibrator = ThermalCalibrator(
@@ -273,6 +288,10 @@ class ThermalStorageModel(BaseDemandModel):
         self.soft_limit_temp_c = soft if soft is not None and soft > 0 else None
         self.soft_limit_hours = max(
             0.0, _as_float(config.get("soft_limit_hours"), 0.0) or 0.0
+        )
+        hysteresis = _as_float(config.get("limit_hysteresis_k"))
+        self.limit_hysteresis_k = max(
+            0.0, DEFAULT_LIMIT_HYSTERESIS_K if hysteresis is None else hysteresis
         )
         self.window_start = config.get("window_start")
         self.window_end = config.get("window_end")
@@ -434,6 +453,61 @@ class ThermalStorageModel(BaseDemandModel):
         self._circuit_seen_at = now
         return off, text
 
+    def current_temperature(self, ctx):
+        """
+        The store's temperature now, and how old it is.
+
+        A bus gateway that drops out for a minute every twenty takes the thermometer
+        with it, and a cycle that reads "unavailable" used to report no demand and
+        throw away a soft-limit plan until the next one. So the last readable value
+        stands in for `TEMPERATURE_HOLD_SECONDS`; after that the store counts as
+        unreadable, as before. Returns ``(temperature_or_None, held_seconds_or_None)``
+        - the age only when the value is a stand-in.
+        """
+        current = _as_float(ctx.readings.get("temp_sensor"))
+        now = getattr(ctx, "now", None)
+        if current is not None:
+            self._temp_last = current
+            self._temp_seen_at = now
+            return current, None
+        if self._temp_last is None or self._temp_seen_at is None or now is None:
+            return None, None
+        age = (now - self._temp_seen_at).total_seconds()
+        if 0 <= age <= TEMPERATURE_HOLD_SECONDS:
+            logger.debug(
+                "[LOADS] '%s': temperature unreadable - using the last reading "
+                "%.1f C from %.0f s ago", self.id, self._temp_last, age,
+            )
+            return self._temp_last, age
+        return None, None
+
+    def _limits(self, current):
+        """
+        Whether the store is under its hard and its soft limit, with hysteresis.
+
+        Going under is immediate: at or below the hard limit, below the soft limit.
+        Coming back is not: the store stays under a limit until it reads
+        ``limit_hysteresis_k`` above it, so a tank hovering on 42.0 keeps its
+        planned charge instead of losing it every other cycle. Returns
+        ``(under_hard, under_soft)``.
+        """
+        band = self.limit_hysteresis_k
+        hard = _as_float(self.frost_protection_temp_c)
+        if hard is None:
+            self._hard_latched = False
+        elif current <= hard:
+            self._hard_latched = True
+        elif current > hard + band:
+            self._hard_latched = False
+        soft = self.soft_limit_temp_c
+        if soft is None:
+            self._soft_latched = False
+        elif current < soft:
+            self._soft_latched = True
+        elif current >= soft + band:
+            self._soft_latched = False
+        return self._hard_latched, self._soft_latched
+
     # -- feasibility --------------------------------------------------------------------
 
     def feasibility(self, ctx):
@@ -497,7 +571,7 @@ class ThermalStorageModel(BaseDemandModel):
 
     def demand(self, ctx):
         """Energy needed over the horizon, and whether to run right now."""
-        current = _as_float(ctx.readings.get("temp_sensor"))
+        current, held_s = self.current_temperature(ctx)
         if current is None:
             logger.debug(
                 "[LOADS] '%s' has no readable temperature - reporting no demand", self.id
@@ -512,10 +586,7 @@ class ThermalStorageModel(BaseDemandModel):
         cover = self.cover_series(ctx, cover_now)
         feasible, feasible_reason = self.feasibility(ctx)
 
-        urgent = (
-            self.frost_protection_temp_c is not None
-            and current <= float(self.frost_protection_temp_c)
-        )
+        urgent, below_soft = self._limits(current)
 
         deadline_slot = None
         if self.deadline_hours:
@@ -580,10 +651,6 @@ class ThermalStorageModel(BaseDemandModel):
         # The charge that has to happen: below the hard limit at once, below the soft
         # limit within the next allowed window, either way whatever the price limit
         # says. A store planned by temperature has its floor in the band instead.
-        below_soft = (
-            self.soft_limit_temp_c is not None
-            and current < float(self.soft_limit_temp_c)
-        )
         must_wh, must_slots, must_by = 0.0, [], None
         if store is None and not circuit_off and (urgent or below_soft):
             cop = reference_cop or mean_cop
@@ -622,6 +689,10 @@ class ThermalStorageModel(BaseDemandModel):
                     if self.frost_protection_temp_c not in (None, "") else None
                 ),
                 "must_wh": round(must_wh, 1),
+                # Whether the store counts as under its soft limit - it does until it
+                # is the hysteresis above it again.
+                "below_soft_limit": bool(below_soft),
+                "limit_hysteresis_k": self.limit_hysteresis_k,
                 "must_by": must_by.isoformat() if must_by is not None else None,
                 # Whether a solver following the temperature may run it now: anywhere
                 # below the storage ceiling, because inside the band the plan - not a
@@ -638,6 +709,9 @@ class ThermalStorageModel(BaseDemandModel):
                 "efficiency_source": slot_efficiency.source_of(self.config),
                 "reference_cop": _round_or_none(reference_cop, 2),
                 "temperature_c": round(current, 2),
+                # Seconds since the reading above was taken, when the sensor is
+                # momentarily unreadable and the last value stands in; None when live.
+                "temperature_held_s": None if held_s is None else round(held_s),
                 "target_temperature_c": round(target, 2),
                 "heat_up_wh_thermal": round(heat_up_wh, 1),
                 "standing_losses_wh_thermal": round(losses_wh, 1),

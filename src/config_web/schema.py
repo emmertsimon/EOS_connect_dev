@@ -3453,6 +3453,23 @@ _ALL_FIELDS: list[FieldDef] = [
         display_group="Operation",
     ),
     FieldDef(
+        key="managed_loads.limit_hysteresis_k",
+        field_type="float",
+        default=0.3,
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Hysteresis of the soft and hard limit, in K: once under a limit the store "
+            "counts as under it until it reads this much above, so a tank hovering on "
+            "the limit keeps its planned charge"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-operation",
+        validation={"min": 0, "max": 5},
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Operation",
+    ),
+    FieldDef(
         key="managed_loads.season_start",
         field_type="str",
         default="04-15",

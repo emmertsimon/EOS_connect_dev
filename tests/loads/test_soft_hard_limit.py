@@ -9,13 +9,17 @@ lands in the next allowed window whatever the price, in its cheapest slot; below
 hard limit it starts now, window or not.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
-from tests.loads.conftest import BERLIN
+from tests.loads.conftest import BERLIN, NOW
 
-from src.loads.models.thermal import REASON_FROST, REASON_SOFT_LIMIT
+from src.loads.models.thermal import (
+    REASON_FROST,
+    REASON_NO_TEMPERATURE,
+    REASON_SOFT_LIMIT,
+)
 from src.loads.presets import TYPE_HOT_WATER_TANK
 
 # 06:30 in the fixtures; hourly slots from midnight.
@@ -131,3 +135,92 @@ def test_a_tank_without_limits_offers_no_charge(make_manager, installation):
     for record in manager.schedulable():
         assert record["must_wh"] == 0
         assert record["must_slots"] == []
+
+
+# -- hysteresis and a dropping-out thermometer -------------------------------------------
+#
+# 24.11., 00:39-00:54: the tank read 41.9 and 42.0 by turns, and the soft-limit plan came
+# and went with it; at 00:48 the EMS gateway dropped the thermometer for a minute and the
+# cycle reported "temperature sensor unavailable" and no demand at all.
+
+
+def _cycle(manager, installation, tank_c):
+    installation.sensors["sensor.ww"] = tank_c
+    manager.run_cycle()
+    return manager.instance("ww").last_demand
+
+
+def _manager(make_manager, installation, entry, clock):
+    installation.sensors.update({"sensor.ww_power": 0.0})
+    installation.prices = [DEAR] * installation.slot_count
+    return make_manager([entry], clock=lambda: clock["now"])
+
+
+def test_a_tank_hovering_on_the_soft_limit_keeps_its_charge(make_manager, installation):
+    clock = {"now": NOW}
+    manager = _manager(make_manager, installation, SOFT, clock)
+
+    assert _cycle(manager, installation, 41.9).must_wh > 0
+    for reading in (42.0, 41.9, 42.0, 42.2):
+        demand = _cycle(manager, installation, reading)
+        assert demand.must_wh > 0, reading
+        assert demand.reason == REASON_SOFT_LIMIT
+        assert demand.detail["below_soft_limit"] is True
+    # 0.3 K above, the price limit rules again.
+    demand = _cycle(manager, installation, 42.3)
+    assert demand.must_wh == 0
+    assert demand.detail["below_soft_limit"] is False
+    # And from above, 42.0 is not under the limit: going under is what counts.
+    assert _cycle(manager, installation, 42.0).must_wh == 0
+
+
+def test_the_hysteresis_is_configurable_and_can_be_off(make_manager, installation):
+    clock = {"now": NOW}
+    manager = _manager(
+        make_manager, installation, dict(SOFT, limit_hysteresis_k=0), clock
+    )
+    assert _cycle(manager, installation, 41.9).must_wh > 0
+    assert _cycle(manager, installation, 42.0).must_wh == 0
+
+
+def test_the_hard_limit_holds_until_the_hysteresis_above(make_manager, installation):
+    clock = {"now": NOW}
+    manager = _manager(make_manager, installation, SOFT_AND_HARD, clock)
+
+    assert _cycle(manager, installation, 32.0).urgent is True
+    assert _cycle(manager, installation, 32.2).reason == REASON_FROST
+    assert _cycle(manager, installation, 32.4).reason == REASON_SOFT_LIMIT
+
+
+def test_a_short_sensor_dropout_keeps_the_plan(make_manager, installation):
+    clock = {"now": NOW}
+    manager = _manager(make_manager, installation, SOFT, clock)
+    before = _cycle(manager, installation, 41.9)
+
+    clock["now"] = NOW + timedelta(minutes=3)
+    demand = _cycle(manager, installation, "unavailable")
+    assert demand.reason == REASON_SOFT_LIMIT
+    assert demand.must_wh == pytest.approx(before.must_wh)
+    assert demand.detail["temperature_c"] == 41.9
+    assert demand.detail["temperature_held_s"] == 180
+
+    clock["now"] = NOW + timedelta(minutes=4)
+    demand = _cycle(manager, installation, 41.8)
+    assert demand.detail["temperature_held_s"] is None
+
+
+def test_a_long_sensor_dropout_still_reports_no_temperature(make_manager, installation):
+    clock = {"now": NOW}
+    manager = _manager(make_manager, installation, SOFT, clock)
+    _cycle(manager, installation, 41.9)
+
+    clock["now"] = NOW + timedelta(minutes=16)
+    demand = _cycle(manager, installation, "unavailable")
+    assert demand.reason == REASON_NO_TEMPERATURE
+    assert demand.total_wh == 0
+
+
+def test_without_any_reading_there_is_nothing_to_hold(make_manager, installation):
+    clock = {"now": NOW}
+    manager = _manager(make_manager, installation, SOFT, clock)
+    assert _cycle(manager, installation, None).reason == REASON_NO_TEMPERATURE
