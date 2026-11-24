@@ -414,7 +414,10 @@
                             cheapest slots. A hot water tank whose price limit keeps it cold on a dear day
                             still gets its midday charge; above the soft limit the price limit rules as
                             before. <em>Soft limit hours</em> can pull the deadline in from the end of the
-                            window.</li>
+                            window. Both limits have a small hysteresis (<em>Limit hysteresis</em>,
+                            0.3 K by default): once under, the store counts as under until it reads that much
+                            above, so a tank hovering on 42.0 / 41.9 C keeps its plan. A temperature sensor
+                            that is unreadable for up to 15 minutes is bridged with its last reading.</li>
                         <li><strong>Strategy</strong> &mdash; <em>Combined</em> uses the grid price but
                             values your own PV surplus at the feed-in tariff, so free solar beats cheap
                             grid energy.</li>
