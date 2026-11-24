@@ -286,8 +286,9 @@ class ThermalStoreConfig:
             has not been planned yet. Without that cap every plan ended by filling the
             store to its ceiling in its last hours. None is ``t_min``.
         terminal_eur_per_k: What a kelvin left in the store at the end of the horizon is
-            worth. None works it out from the horizon's mean price and mean COP, the
-            way the battery values what it ends with.
+            worth. None works it out from the cheapest positive import price ahead
+            (what the battery's default terminal value uses too, see
+            ``Optimizer._terminal_price_eur_per_wh``) and the mean COP.
         penalty_eur_per_k_h: None works it out from the dearest price, high enough
             that the band is near-hard.
     """
@@ -1246,10 +1247,12 @@ class Optimizer:
         cops = [max(0.8, store.at("cop", t, 1.0)) for t in self.time_steps] or [1.0]
         terminal = store.terminal_eur_per_k
         if terminal is None:
-            # What the heat would cost to make again, at the horizon's average: the
-            # same footing the battery's final charge is valued on.
-            mean_price = float(np.mean(self.time_series.p_N)) if self.T else 0.0
-            terminal = capacity * mean_price / float(np.mean(cops))
+            # What the heat would cost to make again, on the same footing as the
+            # battery's final charge. Two stores valued apart are an arbitrage the
+            # solver will take: with heat at the horizon's average and charge at the
+            # cheapest price ahead, plans moved charge into the house in the dear
+            # hours and ended with a warm house and an empty battery.
+            terminal = capacity * self._terminal_price_eur_per_wh() / float(np.mean(cops))
         penalty = store.penalty_eur_per_k_h
         if penalty is None:
             # Ten times what a kelvin-hour would cost with a resistive heater at the
@@ -1257,6 +1260,30 @@ class Optimizer:
             dearest = max(float(self.max_import_price), 0.1e-3)
             penalty = capacity * dearest * 10.0
         return max(0.0, terminal), max(0.0, penalty)
+
+    def _terminal_price_eur_per_wh(self):
+        """
+        What an electrical Wh's worth of heat left in a store at the end of the
+        horizon is worth.
+
+        The cheapest positive import price ahead: the horizon ends at midnight, and
+        heat missing then is made again in the night's trough. It is the figure the
+        battery's default terminal value (``cheapest_ahead``) uses, so heat and charge
+        sit on one footing and cannot be traded against each other at a profit that
+        exists only in the model.
+
+        It deliberately does not follow the battery under the ``stored_price``
+        policy: a PV-charged battery reports a stored price near zero, and heat
+        valued at that would be worthless at the horizon's end - every store, house,
+        pool and hot water alike, would be planned down to its floor for the next day
+        to make up at the grid's price. Only without any positive price ahead does
+        the battery's figure stand in.
+        """
+        prices = [float(p) for p in (self.time_series.p_N or []) if float(p) > 0]
+        if prices:
+            return min(prices)
+        values = [float(bat.p_a or 0.0) for bat in self.batteries]
+        return max(values) if values else 0.0
 
     def _store_objective(self, i, load):
         """What a store planned by temperature contributes to the objective."""

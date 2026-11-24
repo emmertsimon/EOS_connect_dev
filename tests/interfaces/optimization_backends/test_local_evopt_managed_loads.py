@@ -967,3 +967,77 @@ def test_a_store_that_leaks_faster_than_it_holds_stays_a_store():
     # given - never below the air, never anywhere near the model's own -50..150 rails.
     assert min(temps) >= 5.0 - 0.01
     assert max(temps) <= 35.0
+
+
+# --- leftover heat and leftover charge on one footing ---------------------------------------
+
+def _two_stores(terminal=None, t0=20.7):
+    """A house beside a full battery, the night cheaper than the day."""
+    prices = [0.00040] * 12 + [0.00050] * 12
+    store = ThermalStoreConfig(
+        capacity_wh_per_k=HOUSE_C, loss_w_per_k=[HOUSE_H] * T, ambient_c=[8.0] * T,
+        cop=[3.5] * T, gain_wh=[0.0] * T, t_initial=t0, t_min=20.5, t_max=22.0,
+        t_target=21.0, terminal_eur_per_k=terminal,
+    )
+    load = ManagedLoadConfig(id="house", demand_wh=0.0, value_eur_per_wh=0.0,
+                             max_power_w=900.0, min_runtime_slots=1, store=store)
+    opt = _optimizer([load], prices=prices)
+    # What the battery default would value its charge at: the cheapest price ahead.
+    opt.batteries[0].p_a = 0.00040
+    opt.batteries[0].s_initial = 9000
+    return opt
+
+
+def _battery_left(opt):
+    return pulp.value(opt.variables['s'][0][-1])
+
+
+def test_leftover_heat_is_valued_like_leftover_charge():
+    opt = _two_stores()
+    terminal, _ = opt._store_values(opt.managed_loads[0])  # pylint: disable=protected-access
+    assert terminal == pytest.approx(HOUSE_C * 0.00040 / 3.5)
+
+
+def test_the_battery_is_not_emptied_into_the_house():
+    """Valued at the horizon's average, heat out-bid charge, and the plan drained one
+    store into the other in the dearest hours. On one footing there is no such trade."""
+    mean_price = (0.00040 + 0.00050) / 2
+    old = _two_stores(terminal=HOUSE_C * mean_price / 3.5)
+    old_result = old.solve()
+    new = _two_stores()
+    new_result = new.solve()
+    assert new_result["status"] == old_result["status"] == "Optimal"
+
+    assert _temperature(old_result)[-1] == pytest.approx(21.0, abs=0.05)
+    assert _temperature(new_result)[-1] < 20.8, "no heat banked for after the horizon"
+    assert min(_temperature(new_result)) >= 20.5 - 1e-6, "comfort still holds"
+    assert _battery_left(new) > _battery_left(old) + 500
+
+
+def test_without_a_battery_the_cheapest_price_ahead_values_the_heat():
+    prices = [0.00040] * 12 + [0.00050] * 12
+    opt = _optimizer([_house()], prices=prices, battery=False)
+    terminal, _ = opt._store_values(opt.managed_loads[0])  # pylint: disable=protected-access
+    assert terminal == pytest.approx(HOUSE_C * 0.00040 / 3.5)
+
+
+def test_a_battery_valued_at_its_stored_price_does_not_make_heat_worthless():
+    """
+    Under the stored_price policy a PV-charged battery reports a terminal price near
+    zero. Heat valued at that would be worth nothing at the horizon's end, and the
+    house would be planned down to its floor for the next day to make up.
+    """
+    opt = _two_stores()
+    opt.batteries[0].p_a = 0.0
+    terminal, _ = opt._store_values(opt.managed_loads[0])  # pylint: disable=protected-access
+    assert terminal == pytest.approx(HOUSE_C * 0.00040 / 3.5)
+    opt.batteries[0].p_a = 1e-6
+    terminal, _ = opt._store_values(opt.managed_loads[0])  # pylint: disable=protected-access
+    assert terminal == pytest.approx(HOUSE_C * 0.00040 / 3.5)
+
+
+def test_without_a_positive_price_the_batterys_figure_stands_in():
+    opt = _two_stores()
+    opt.time_series.p_N = [0.0] * T
+    terminal, _ = opt._store_values(opt.managed_loads[0])  # pylint: disable=protected-access
+    assert terminal == pytest.approx(HOUSE_C * 0.00040 / 3.5)
