@@ -25,7 +25,7 @@ from .schema import (
     REMOTE_DATA_SOURCE_TYPES,
 )
 from .entity_probe import probe_entity
-from .merger import central_connections
+from .merger import DERIVED_SECRET_KEYS, central_connections
 
 try:  # running from src/ as a script — src/ is on sys.path
     from interfaces.evcc_entities import (
@@ -1833,6 +1833,18 @@ def _coerce_value(field_def, value):
     return value
 
 
+def _is_secret(full_key: str) -> bool:
+    """Whether the merged config's *full_key* holds a credential the API must not show.
+
+    A schema field of type ``password``, or one of the keys the merge derives from
+    such a field (``inverter.token`` is the data source's access token).
+    """
+    if full_key in DERIVED_SECRET_KEYS:
+        return True
+    field_def = _schema.get(full_key)
+    return bool(field_def and field_def.field_type == "password")
+
+
 def _mask_passwords(config: dict, prefix: str = "") -> dict:
     """Recursively mask password fields in a nested config dict."""
     result = {}
@@ -1842,12 +1854,10 @@ def _mask_passwords(config: dict, prefix: str = "") -> dict:
             result[key] = _mask_passwords(value, full_key)
         elif isinstance(value, list):
             result[key] = value
+        elif _is_secret(full_key):
+            result[key] = "********" if value else ""
         else:
-            field_def = _schema.get(full_key)
-            if field_def and field_def.field_type == "password":
-                result[key] = "********" if value else ""
-            else:
-                result[key] = value
+            result[key] = value
     return result
 
 
@@ -1863,8 +1873,7 @@ def _mask_passwords_flat(data: dict, section: str = "") -> dict:
     result = {}
     for key, value in data.items():
         lookup_key = key if "." in key else f"{section}.{key}" if section else key
-        field_def = _schema.get(lookup_key)
-        if field_def and field_def.field_type == "password":
+        if _is_secret(lookup_key):
             result[key] = "********" if value else ""
         else:
             result[key] = value

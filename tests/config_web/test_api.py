@@ -272,6 +272,29 @@ class TestConfigAPI:
         data = resp.get_json()
         assert data["password"] == "********"
 
+    def test_the_inverters_derived_token_is_masked(self, client):
+        """A Home Assistant inverter gets the data source's token copied in by the
+        merge. It has no field of its own, so the schema cannot mark it - and both
+        read routes handed out the long-lived token in clear text."""
+        resp = client.put(
+            "/api/config/",
+            data=json.dumps(
+                {
+                    "data_source.type": "homeassistant",
+                    "data_source.url": "http://ha:8123",
+                    "data_source.access_token": "ha_long_lived_token",
+                    "inverter.type": "homeassistant",
+                }
+            ),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        section = client.get("/api/config/section/inverter").get_json()
+        everything = client.get("/api/config/").get_json()
+        assert section["token"] == "********"
+        assert everything["inverter"]["token"] == "********"
+        assert "ha_long_lived_token" not in json.dumps(everything)
+
     def test_empty_password_not_masked(self, client):
         """Empty password should show as empty, not asterisks."""
         client.put(

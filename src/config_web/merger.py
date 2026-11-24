@@ -586,6 +586,13 @@ def _apply_evcc_battery_entities(
     return resolved
 
 
+# Keys the merge fills in with a credential copied from a password field. They have
+# no FieldDef of their own - the user never edits them - so nothing in the schema
+# marks them secret, and whoever masks the merged config has to be told (see
+# config_web.api._is_secret).
+DERIVED_SECRET_KEYS = frozenset({"inverter.token"})
+
+
 def _apply_inverter_data_source_injection(
     result: dict, all_settings: dict[str, Any]
 ) -> None:
