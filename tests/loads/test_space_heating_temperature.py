@@ -175,3 +175,94 @@ def test_a_store_without_a_demand_waits_for_the_solver_it_was_offered_to(
     assert item.waiting_for_schedule_since is not None, (
         "offered to the solver but not waiting for it"
     )
+
+
+# --- what counts as "planned to run" ----------------------------------------------------------
+
+def test_solver_residue_in_the_running_slot_does_not_release(make_manager, installation):
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    plan = [0.0] * 48
+    plan[6] = 1e-6
+    release = item.adopt_schedule(plan, manager._last_ctx_for["house"])
+    assert release["released"] is False
+
+
+def test_residue_does_not_hold_a_running_appliance_on(make_manager, installation):
+    """Released once, then held on by a plan that puts the running slot at 0 W."""
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    ctx = manager._last_ctx_for["house"]
+    plan = [0.0] * 48
+    plan[6] = 900.0
+    assert item.adopt_schedule(plan, ctx)["released"] is True
+    plan[6] = 3e-4
+    assert item.adopt_schedule(plan, ctx)["released"] is False
+
+
+def test_a_run_in_the_last_seconds_of_a_slot_still_counts(make_manager, installation):
+    import dataclasses
+    from datetime import timedelta
+
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    ctx = manager._last_ctx_for["house"]
+    slot_end = ctx.anchor + timedelta(seconds=(ctx.current_slot + 1) * ctx.time_frame_base)
+    late = dataclasses.replace(ctx, now=slot_end - timedelta(seconds=90))
+    rated_w = item.last_demand.max_power_w
+    plan = [0.0] * 48
+    plan[6] = rated_w * 90 / 3600  # the rating, for the 90 s that are left
+    assert item.adopt_schedule(plan, late)["released"] is True
+
+
+def test_residue_is_not_reported_as_the_next_start(make_manager, installation):
+    manager = _house_manager(make_manager, installation, rooms=21.3,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    plan = [0.0] * 48
+    plan[10] = 2e-5
+    release = item.adopt_schedule(plan, manager._last_ctx_for["house"])
+    assert release["next_release_start"] is None
+    assert item.last_plan[10] == 0.0
+
+
+def _small_remainder(make_manager, installation):
+    """A cold house and, in the running slot, a little less than a solver run."""
+    manager = _house_manager(make_manager, installation, rooms=20.0,
+                             min_runtime_minutes=0)
+    item = manager.instance("house")
+    ctx = manager._last_ctx_for["house"]
+    threshold = item._run_threshold_wh(item.last_demand, ctx)  # pylint: disable=protected-access
+    assert threshold > 1.25, "the case needs a remainder above the 1 Wh floor"
+    plan = [0.0] * 48
+    plan[ctx.current_slot] = 0.8 * threshold
+    return item, ctx, plan
+
+
+def test_the_modules_own_plan_releases_a_small_remainder(make_manager, installation):
+    """
+    The run threshold is for solver output. The module's own planner places whole
+    energies, and a remainder it puts into the running slot is meant to run: held
+    back, it would be planned into the same slot again every cycle.
+    """
+    item, ctx, plan = _small_remainder(make_manager, installation)
+    release = item._gate_on(item.last_demand, ctx, plan)  # pylint: disable=protected-access
+    assert release["released"] is True
+
+
+def test_a_solver_plan_with_the_same_remainder_does_not_release(make_manager, installation):
+    item, ctx, plan = _small_remainder(make_manager, installation)
+    release = item._gate_on(  # pylint: disable=protected-access
+        item.last_demand, ctx, plan, scheduled=True
+    )
+    assert release["released"] is False
+
+
+def test_the_modules_own_plan_ignores_sub_wh_residue(make_manager, installation):
+    item, ctx, plan = _small_remainder(make_manager, installation)
+    plan[ctx.current_slot] = 0.4
+    release = item._gate_on(item.last_demand, ctx, plan)  # pylint: disable=protected-access
+    assert release["released"] is False
