@@ -3018,12 +3018,12 @@ _ALL_FIELDS: list[FieldDef] = [
         section="managed_loads",
         level="expert",
         description=(
-            "How much the COP changes per kelvin of ambient temperature, as a fraction "
-            "of the nominal value. Refined automatically"
+            "How much the COP rises per kelvin of warmer ambient air, as a fraction "
+            "of the nominal value - never negative. Refined automatically"
         ),
         labels=["restart_required"],
         help_url="config-managed-loads.html#managed-loads-calibration",
-        validation={"min": -0.06, "max": 0.06},
+        validation={"min": 0.0, "max": 0.06},
         depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
         display_group="Physical",
     ),

@@ -15,15 +15,16 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 try:
-    from timeseries_grid import local_midnight
+    from timeseries_grid import local_midnight, parse_anchor, reanchor, slots_between
 except ImportError:  # imported as src.interfaces (tests)
-    from ...timeseries_grid import local_midnight
+    from ...timeseries_grid import local_midnight, parse_anchor, reanchor, slots_between
 from .optimization_backend_evopt import (
     DEFAULT_TERMINAL_SOC_VALUE,
     EVOptBackend,
+    one_clock_per_run,
 )
 from ..charging_curve import (  # pylint: disable=relative-beyond-top-level
     ChargingCurveError,
@@ -219,6 +220,7 @@ class LocalEVOptBackend(EVOptBackend):
     # top, and three keep a two-day quarter-hourly solve at a few seconds.
     MAX_CHARGE_CURVE_PIECES = 3
 
+    @one_clock_per_run
     def optimize(self, eos_request, timeout=180, managed_loads=None,
                  managed_load_budget_w=0.0, charge_power_limit=None):
         """
@@ -327,6 +329,9 @@ class LocalEVOptBackend(EVOptBackend):
                 evopt_response, evopt_request, eos_request
             )
             eos_response["managed_loads"] = self._managed_load_schedules(evopt_response)
+            # The midnight the schedules count from: just after midnight it can differ
+            # from the managed-load module's own - see `_on_run_anchor`.
+            eos_response["managed_loads_anchor"] = self._run_anchor().isoformat()
             eos_response["managed_loads_cost"] = self._managed_load_cost(
                 optimizer, evopt_request, evopt_response,
                 None if budget_s is None else budget_s - (time.time() - start_time),
@@ -364,7 +369,7 @@ class LocalEVOptBackend(EVOptBackend):
     def _plan_start(self):
         """Wall-clock start of solver slot 0: the current slot, as the request does."""
         params = self._calculate_time_parameters()
-        anchor = local_midnight(self.time_zone, datetime.now(self.time_zone))
+        anchor = local_midnight(self.time_zone, self._now())
         return anchor + timedelta(seconds=params["current_slot"] * self.time_frame_base)
 
     def _attach_previous_plan(self, optimizer, plan_start):
@@ -777,6 +782,7 @@ class LocalEVOptBackend(EVOptBackend):
         for entry in managed_loads or []:
             if not isinstance(entry, dict):
                 continue
+            entry = self._on_run_anchor(entry)
             try:
                 power = float(entry.get("max_power_w", 0) or 0)
                 demand = float(entry.get("demand_wh", 0) or 0)
@@ -817,6 +823,45 @@ class LocalEVOptBackend(EVOptBackend):
                 len(configs), ", ".join(c.id for c in configs),
             )
         return configs
+
+    def _run_anchor(self):
+        """Local midnight of this run's clock - slot 0 of every EOS array it handles."""
+        return local_midnight(self.time_zone, self._now())
+
+    # Per-slot record fields and their padding; undescribed slots stay closed.
+    _RECORD_SLOT_FIELDS = (("feasible", False), ("efficiency", 1.0), ("day_index", -1))
+    _STORE_SLOT_FIELDS = ("loss_w_per_k", "ambient_c", "cop", "gain_wh")
+
+    def _on_run_anchor(self, entry):
+        """
+        *entry* with its per-slot fields counted from this run's midnight.
+
+        The manager stamps its records with the midnight its own cycle counted from.
+        For the first minutes of a day that is not this run's: a record from 23:59
+        rotated by a 00:03 clock handed the solver yesterday's air temperatures and
+        COPs. Re-indexed here, the solver sees the right hours whichever side of
+        midnight the record was made. Without an anchor it is taken as on this grid.
+        """
+        anchor = parse_anchor(entry.get("anchor"))
+        if anchor is None:
+            return entry
+        shift = slots_between(anchor, self._run_anchor(), self.time_frame_base)
+        if shift == 0:
+            return entry
+        moved = dict(entry)
+        for key, fill in self._RECORD_SLOT_FIELDS:
+            if moved.get(key):
+                moved[key] = reanchor(moved[key], shift, fill)
+        store = moved.get("store")
+        if isinstance(store, dict):
+            store = dict(store)
+            for key in self._STORE_SLOT_FIELDS:
+                values = store.get(key)
+                if values:
+                    # Carried on, not zeroed: the last air temperature beats 0 C.
+                    store[key] = reanchor(values, shift, values[-1])
+            moved["store"] = store
+        return moved
 
     def _solver_store(self, store):
         """
@@ -991,7 +1036,7 @@ class LocalEVOptBackend(EVOptBackend):
             return evopt_request
 
         # Calculate what hour the last forecast slot represents
-        now = datetime.now(self.time_zone)
+        now = self._now()
         total_forecast_seconds = sum(dt)
         forecast_hours = total_forecast_seconds / 3600
         forecast_end_hour = int((now.hour + forecast_hours) % 24)

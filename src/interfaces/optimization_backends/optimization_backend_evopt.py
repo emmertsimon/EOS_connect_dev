@@ -13,10 +13,12 @@ Typical usage example:
     eos_response, avg_runtime = backend.optimize(eos_request)
 """
 
+import functools
 import logging
 import time
 import json
 import os
+import threading
 from datetime import datetime
 
 try:  # running from src/ — src/ is on sys.path
@@ -46,6 +48,56 @@ def coerce_terminal_soc_value(value):
     make a junk value stick for the lifetime of the process.
     """
     return value if value in TERMINAL_SOC_VALUES else DEFAULT_TERMINAL_SOC_VALUE
+
+
+def one_clock_per_run(method):
+    """
+    Read the wall clock once for a whole optimization run.
+
+    A run turns the request into solver slots on the way in and the solution back into
+    EOS slots on the way out, and each of those steps used to ask the clock for the
+    current slot on its own. The scheduler starts the quarter-aligned run on purpose
+    so that it *finishes* on the boundary, which means the way in regularly reads slot
+    n and the way out slot n + 1: every series in the response - the battery's control
+    arrays and the managed-load schedules alike - came back one slot late, and stayed
+    that way until the next run a few minutes later. A load planned for the slot that
+    had just begun read as unplanned, and its release dropped at every quarter hour.
+
+    One reading, taken as the run starts, keeps both directions on the same slot. A
+    nested call (a subclass's optimize calling into the base) keeps the outer reading.
+    The reading is kept per thread and per backend, so a second run started from
+    another thread (e.g. a manual trigger while the scheduler is running) takes its
+    own reading instead of borrowing or clearing this one.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        pins = _run_clock_pins()
+        if id(self) in pins:
+            return method(self, *args, **kwargs)
+        pins[id(self)] = datetime.now(self.time_zone)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            pins.pop(id(self), None)
+
+    return wrapper
+
+
+_RUN_CLOCK = threading.local()
+
+
+def _run_clock_pins():
+    """This thread's pinned run clocks, by backend id - see `one_clock_per_run`."""
+    pins = getattr(_RUN_CLOCK, "pins", None)
+    if pins is None:
+        pins = _RUN_CLOCK.pins = {}
+    return pins
+
+
+def pinned_run_clock(backend):
+    """The clock reading the current thread's run of `backend` holds, or None."""
+    return _run_clock_pins().get(id(backend))
 
 
 class EVOptBackend:
@@ -79,6 +131,7 @@ class EVOptBackend:
         self.last_optimization_runtimes = [0] * 5
         self.last_optimization_runtime_number = 0
 
+    @one_clock_per_run
     def optimize(self, eos_request, timeout=180):
         """
         Accepts EOS-format request, transforms to EVopt format, sends request,
@@ -316,7 +369,7 @@ class EVOptBackend:
         except (TypeError, ValueError):
             price_accu_wh = 0.0
 
-        now = datetime.now(self.time_zone)
+        now = self._now()
         # Absolute slot since true local midnight - the EMS arrays are
         # midnight-anchored, and the wall clock is one slot off against them
         # for ~21 hours after each DST transition.
@@ -467,7 +520,7 @@ class EVOptBackend:
         # Compute dt series based on time_frame_base
         # Each entry corresponds to the time frame in seconds
         # first entry may be shorter to align with time_frame_base
-        now = datetime.now(self.time_zone)
+        now = self._now()
         # Phase into the current slot. The modulo makes this DST-neutral (the
         # offsets shift by whole hours), but it shares the grid's anchor so
         # there is exactly one definition of "since midnight" here.
@@ -658,6 +711,11 @@ class EVOptBackend:
             padded += [fill] * (total - len(padded))
         return padded[:total]
 
+    def _now(self):
+        """The moment this run is planned from - see `one_clock_per_run`."""
+        pinned = pinned_run_clock(self)
+        return pinned if pinned is not None else datetime.now(self.time_zone)
+
     def _calculate_time_parameters(self):
         """
         Calculate time-based parameters for array sizing and padding.
@@ -674,7 +732,7 @@ class EVOptBackend:
         n_result is defined from the grid (n_control - current_slot) so pad_past
         and the result window always tile the control array exactly.
         """
-        now = datetime.now(self.time_zone)
+        now = self._now()
         anchor = local_midnight(self.time_zone, now)
         n_control = horizon_slots(self.time_frame_base)
         current_slot = int((now - anchor).total_seconds()) // self.time_frame_base

@@ -282,6 +282,63 @@ def test_a_heat_meter_also_measures_where_the_cop_may_be_fitted():
     assert calibrator.cop_source == "heat_meter"
 
 
+def test_a_handful_of_windows_does_not_move_the_loss():
+    """Half a day gives a few noisy windows; the configured loss stands until there
+    are enough to outweigh it."""
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.observe_series(_simulate(days=0.5))
+    assert len(calibrator._rows) < 12  # pylint: disable=protected-access
+    assert calibrator.loss_coefficient == pytest.approx(0.4)
+    assert calibrator.state()["loss_identified"] is False
+
+
+def test_with_enough_windows_the_loss_is_learned():
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.observe_series(_simulate(days=2))
+    assert calibrator.loss_coefficient == pytest.approx(TRUE_K, rel=0.1)
+    assert calibrator.state()["loss_identified"] is True
+
+
+def test_a_loss_the_windows_cannot_explain_stays_at_its_prior():
+    """A room average read to a tenth, wobbling with doors and sun: the windows are
+    noise, and a loss fitted to them would be too."""
+    import random
+
+    rng = random.Random(7)
+    samples = _simulate(days=3, heat_meter=True)
+    for sample in samples:
+        sample["medium_c"] = round(sample["medium_c"] + rng.uniform(-0.3, 0.3), 1)
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.observe_series(samples)
+    assert len(calibrator._rows) >= 12  # pylint: disable=protected-access
+    assert calibrator.fit_quality() < 0.3
+    assert calibrator.loss_coefficient == pytest.approx(0.4)
+    assert calibrator.state()["loss_identified"] is False
+
+
+def test_whether_the_loss_was_measured_survives_a_restart():
+    learned = _house_calibrator(loss=0.4)
+    learned.observe_series(_simulate(days=2))
+    restored = _house_calibrator(loss=0.4)
+    restored.restore(learned.state())
+    assert restored.loss_identified is True
+
+    held = _house_calibrator(loss=0.4)
+    held.observe_series(_simulate(days=0.5))
+    restored = _house_calibrator(loss=0.4)
+    restored.restore(held.state())
+    assert restored.loss_identified is False
+
+
+def test_a_state_saved_before_the_flag_reads_a_moved_loss_as_measured():
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.restore({"loss_coefficient": 0.55})
+    assert calibrator.loss_identified is True
+    calibrator = _house_calibrator(loss=0.4)
+    calibrator.restore({"loss_coefficient": 0.4})
+    assert calibrator.loss_identified is False
+
+
 def test_a_heat_meter_that_never_moves_is_ignored():
     samples = _simulate(days=3, heat_meter=True)
     for sample in samples:

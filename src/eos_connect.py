@@ -1791,6 +1791,7 @@ class OptimizationScheduler:
             load_manager.adopt_schedules(
                 optimized_response.get("managed_loads") or {},
                 cost=optimized_response.get("managed_loads_cost"),
+                anchor=optimized_response.get("managed_loads_anchor"),
             )
 
         if error is not True:
