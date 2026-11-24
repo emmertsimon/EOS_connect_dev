@@ -46,6 +46,15 @@ REASON_FROST = "frost protection"
 REASON_HEATING = "below target temperature"
 REASON_HOLDING = "covering standing losses"
 REASON_OUT_OF_SEASON = "out of season"
+REASON_CIRCUIT_OFF = "heating circuit off"
+
+# What a circuit sensor reads while the heat pump's own controller has switched the
+# circuit off - the summer shutdown of a weather-compensated controller, for instance.
+DEFAULT_CIRCUIT_OFF_STATES = ("off",)
+# Readings that say nothing about the circuit. A bus gateway that drops out for a minute
+# every twenty must not flip the plan, so the last definite reading stands this long.
+CIRCUIT_UNKNOWN_STATES = ("", "unavailable", "unknown", "none")
+CIRCUIT_HOLD_SECONDS = 30 * 60
 
 # How a store is planned. By energy, the original way: an amount over the horizon,
 # placed by price. By temperature: the store itself, handed to a solver that can follow
@@ -111,13 +120,23 @@ def _in_window(hour, start, end):
     return hour >= start or hour < end
 
 
+def _parse_states(value, default):
+    """A comma-separated list (or a list) of states, lower-cased; *default* if empty."""
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = str(value or "").split(",")
+    states = tuple(str(item).strip().lower() for item in items if str(item).strip())
+    return states or tuple(default)
+
+
 class ThermalStorageModel(BaseDemandModel):
     """Stored-heat demand with an online-calibrated loss coefficient and COP."""
 
     kind = KIND_CONTINGENT
     sensor_keys = ("temp_sensor", "target_temp_sensor", "power_sensor",
                    "ambient_temp_sensor", "cover_sensor", "heat_sensor",
-                   "cop_air_sensor")
+                   "cop_air_sensor", "circuit_sensor")
 
     def __init__(self, entry_id, config, calibration=None):
         super().__init__(entry_id, config)
@@ -127,6 +146,10 @@ class ThermalStorageModel(BaseDemandModel):
         self.calibration_options = dict(calibration or {})
         self.calibrator = self._new_calibrator()
         self.cover_habit = CoverHabit()
+        # The last definite reading of the circuit sensor, and when it was taken.
+        self._circuit_off = None
+        self._circuit_state = None
+        self._circuit_seen_at = None
 
     def _new_calibrator(self):
         return ThermalCalibrator(
@@ -178,6 +201,11 @@ class ThermalStorageModel(BaseDemandModel):
         except (TypeError, ValueError):
             headroom = DEFAULT_STORAGE_HEADROOM_K
         self.storage_headroom_k = max(0.0, headroom)
+
+        self.circuit_sensor = str(config.get("circuit_sensor") or "").strip()
+        self.circuit_off_states = _parse_states(
+            config.get("circuit_off_states"), DEFAULT_CIRCUIT_OFF_STATES
+        )
 
     def reconfigure(self, config):
         """Apply changed settings, keeping the calibrator and everything it learned."""
@@ -262,6 +290,54 @@ class ThermalStorageModel(BaseDemandModel):
         # A configured threshold is authoritative, however low - the user knows the
         # circuit. Only the unset zero stands down to the bare noise-floor guess.
         return power >= (self.standby_threshold_w or IDLE_POWER_W)
+
+    def circuit_off(self, ctx):
+        """
+        Whether the heat pump's own controller has switched this circuit off.
+
+        A weather-compensated controller shuts its heating circuit down in summer mode,
+        whatever the room thermostat or a release signal asks for. Planning heat into
+        those hours only moves the battery around a load that cannot appear, and the
+        release turns into a promise the pump does not keep. So a configured
+        ``circuit_sensor`` reading one of ``circuit_off_states`` takes the whole horizon
+        out until it reads otherwise; the next cycle after it comes back plans again.
+
+        An unreadable sensor is not an off circuit: the last definite reading stands
+        for half an hour, then the circuit counts as on, the state it had before the
+        sensor existed. Returns ``(off, state_text)``.
+        """
+        if not self.circuit_sensor:
+            return False, None
+        raw = ctx.readings.get("circuit_sensor")
+        text = "" if raw is None else str(raw).strip().lower()
+        now = getattr(ctx, "now", None)
+        if text in CIRCUIT_UNKNOWN_STATES:
+            fresh = (
+                self._circuit_seen_at is not None and now is not None
+                and (now - self._circuit_seen_at).total_seconds() <= CIRCUIT_HOLD_SECONDS
+            )
+            if fresh and self._circuit_off is not None:
+                return self._circuit_off, self._circuit_state
+            return False, None
+        off = text in self.circuit_off_states
+        if off != bool(self._circuit_off):
+            if off:
+                logger.warning(
+                    "[LOADS] '%s': heating circuit reads '%s' (%s) - the heat pump's "
+                    "controller has switched it off, so nothing is planned or released "
+                    "until it is back. A summer shutdown threshold set too low is the "
+                    "usual cause | Config: #managed-loads",
+                    self.id, text, self.circuit_sensor,
+                )
+            else:
+                logger.info(
+                    "[LOADS] '%s': heating circuit is back ('%s') - planning again",
+                    self.id, text,
+                )
+        self._circuit_off = off
+        self._circuit_state = text
+        self._circuit_seen_at = now
+        return off, text
 
     # -- feasibility --------------------------------------------------------------------
 
@@ -380,12 +456,24 @@ class ThermalStorageModel(BaseDemandModel):
                 )
                 total_wh = thermal_to_electrical_wh(thermal_wh, reference_cop)
 
+        circuit_off, circuit_state = self.circuit_off(ctx)
+        if circuit_off:
+            # The controller decides, not the plan: nothing to place, nothing to
+            # release, and no frost run either - a switched-off circuit cannot deliver
+            # one. The energy figures stay, so the card still says what is missing.
+            feasible = [False] * ctx.slot_count
+            feasible_reason = [REASON_CIRCUIT_OFF] * ctx.slot_count
+            urgent = False
+
         active, reason = self._control_state(current, target, ctx.readings, urgent)
         if not any(feasible):
             reason = REASON_OUT_OF_SEASON
+        if circuit_off:
+            active, reason = False, REASON_CIRCUIT_OFF
 
         store = None
-        if self.planning_mode == PLAN_BY_TEMPERATURE and self.volume_m3 > 0:
+        if (self.planning_mode == PLAN_BY_TEMPERATURE and self.volume_m3 > 0
+                and not circuit_off):
             store = self.thermal_store(ctx, current, target, cover)
 
         return EnergyDemand(
@@ -405,8 +493,13 @@ class ThermalStorageModel(BaseDemandModel):
                 # below the storage ceiling, because inside the band the plan - not a
                 # deadband - decides when heat is worth putting in.
                 "storage_active": bool(
-                    urgent or current < target + self.storage_headroom_k
+                    not circuit_off
+                    and (urgent or current < target + self.storage_headroom_k)
                 ),
+                # The heat pump controller's own on/off for this circuit, where a
+                # circuit_sensor is configured; None without one.
+                "circuit_off": circuit_off,
+                "circuit_state": circuit_state,
                 "planning_mode": self.planning_mode,
                 "efficiency_source": slot_efficiency.source_of(self.config),
                 "reference_cop": _round_or_none(reference_cop, 2),

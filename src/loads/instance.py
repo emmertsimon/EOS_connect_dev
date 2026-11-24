@@ -67,6 +67,10 @@ def _offerable(demand):
     """
     if demand is None or (demand.max_power_w or 0) <= 0:
         return False
+    # A circuit the heat pump's controller has switched off cannot take anything a
+    # solver places; offering it would only have the solver work round all-false slots.
+    if (demand.detail or {}).get("circuit_off"):
+        return False
     return demand.store is not None or (demand.total_wh or 0) > 0
 
 
@@ -503,6 +507,10 @@ class ManagedLoad:
             urgent=demand.urgent,
             now=ctx.now,
             has_demand=active,
+            # "No demand" would hide why: the house is cold, the controller is not.
+            idle_reason=(
+                demand.reason if (demand.detail or {}).get("circuit_off") else None
+            ),
         )
         release["next_release_start"] = self._next_release_start(plan, ctx)
         release["energy_needed_wh"] = round(demand.total_wh, 1)

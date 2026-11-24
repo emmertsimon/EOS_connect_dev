@@ -1537,6 +1537,13 @@ class ManagedLoadManager:
         if sample["ambient_c"] is None:
             return
 
+        # Whether the heat pump's controller had the circuit off, where a circuit
+        # sensor says so: a sample taken then shows a pump that was not allowed to
+        # run, not one that chose not to, and anything learning from runs can tell
+        # the two apart. Only recorded where the sensor is configured.
+        if getattr(item.model, "circuit_sensor", "") and hasattr(item.model, "circuit_off"):
+            sample["circuit_off"] = bool(item.model.circuit_off(ctx)[0])
+
         self.stats.samples_recorded += 1
         self._remember_medium(item.id, sample.get("timestamp"), sample.get("medium_c"))
         if item.observe(sample):

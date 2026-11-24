@@ -2848,6 +2848,39 @@ _ALL_FIELDS: list[FieldDef] = [
         display_group="Temperature",
     ),
     FieldDef(
+        key="managed_loads.circuit_sensor",
+        field_type="sensor",
+        default="",
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Entity/item reporting whether the heat pump's own controller has the "
+            "circuit switched on - e.g. its operating state, which reads 'off' in the "
+            "summer shutdown. While it reads one of the off states nothing is planned "
+            "or released, and the reason says so. Unavailable readings keep the last "
+            "state for 30 minutes. Leave empty to ignore"
+        ),
+        labels=["restart_required"],
+        help_url="config-managed-loads.html#managed-loads-circuit",
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Temperature",
+    ),
+    FieldDef(
+        key="managed_loads.circuit_off_states",
+        field_type="str",
+        default="off",
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Comma-separated states of the circuit sensor that mean 'switched off' "
+            "(case does not matter)"
+        ),
+        help_url="config-managed-loads.html#managed-loads-circuit",
+        hot_reload=True,
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Temperature",
+    ),
+    FieldDef(
         key="managed_loads.volume_m3",
         field_type="float",
         default=30.0,

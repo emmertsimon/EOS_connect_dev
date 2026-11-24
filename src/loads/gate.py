@@ -100,7 +100,7 @@ class ReleaseGate:
 
     # -- decision ---------------------------------------------------------------------
 
-    def evaluate(self, planned, urgent, now, has_demand=True):
+    def evaluate(self, planned, urgent, now, has_demand=True, idle_reason=None):
         """
         Decide whether the load is released right now.
 
@@ -111,6 +111,8 @@ class ReleaseGate:
             has_demand: False once the target is reached - it ends a minimum-runtime
                 hold, because holding a pump on against a satisfied setpoint would
                 overshoot the very target the hold exists to reach.
+            idle_reason: What to report instead of "no demand" when the model knows
+                a more specific cause - a heating circuit its controller switched off.
 
         Returns a dict with ``released``, ``state`` and ``reason``.
         """
@@ -125,7 +127,7 @@ class ReleaseGate:
             return self._settle(True, REASON_MIN_RUNTIME, now)
 
         if not has_demand:
-            return self._settle(False, REASON_NO_DEMAND, now)
+            return self._settle(False, idle_reason or REASON_NO_DEMAND, now)
 
         if planned:
             return self._settle(True, REASON_PLANNED, now)
