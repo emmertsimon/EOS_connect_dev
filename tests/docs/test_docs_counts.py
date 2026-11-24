@@ -64,6 +64,12 @@ def spelled_number(word):
     would turn this whole module into a test that always passes.
     """
     parts = word.strip().lower().replace("–", "-").split("-")
+    # "A hundred", "a-hundred-and-four": the counts have outgrown the tens.
+    if parts and parts[0] == "a":
+        parts = parts[1:]
+    if parts and parts[0] == "hundred":
+        rest = parts[2:] if parts[1:2] == ["and"] else parts[1:]
+        return 100 + (spelled_number("-".join(rest)) if rest else 0)
     if len(parts) == 1:
         single = parts[0]
         if single in _UNITS:

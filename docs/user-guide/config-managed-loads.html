@@ -830,6 +830,29 @@
                         the COP the meter measured, until the history shows the real rise. A negative
                         <code>cop_air_coeff</code> from an older configuration is treated as 0.</p>
 
+                    <h3 id="managed-loads-cop-air">A tank indoors, a heat pump outdoors</h3>
+                    <p>A hot water tank loses its heat to the room it stands in, but an
+                        air-source heat pump takes the heat it puts in from the outdoor air. One
+                        ambient temperature cannot be both: at the room's 18&nbsp;&deg;C the COP is
+                        the same in every slot, and the plan sees no reason to make hot water at a
+                        mild midday rather than on a frosty morning. Set to the outdoor air instead,
+                        the losses come out half again too high in winter.</p>
+                    <p><code>cop_air_sensor</code> separates the two. Point it at the heat pump's
+                        own outdoor sensor (read over its bus or Modbus) or any outdoor thermometer: the COP then
+                        follows the outdoor forecast, matched to that sensor hour by hour in the same
+                        way as an outdoor load's <a href="#managed-loads-ambient">ambient</a>, while
+                        the losses keep using the tank's surroundings. A heat meter
+                        (<code>heat_sensor</code>) is then fitted against the outdoor air too, so the
+                        slope can be measured. An air limit (<code>min_ambient_temp_c</code>) applies to
+                        the heat pump's air as well. Leave it empty where the store and the heat pump
+                        share the air &mdash; a pool, or a house heated by its own heat pump.</p>
+                    <p data-level="expert">Expect a smaller effect than on the space heating. Heating water to
+                        50&ndash;55&nbsp;&deg;C is a larger lift than feeding a floor or radiator
+                        circuit, so the outdoor air is a smaller part of it: a hot water COP typically
+                        rises by a few hundredths per kelvin of outdoor air, noticeably less than the
+                        space heating from the same unit. A few per cent between a frosty morning and a
+                        mild afternoon is still enough to decide a day of flat prices.</p>
+
                     <h3 id="managed-loads-cover">The cover</h3>
                     <p>A pool cover is worth roughly two thirds of the heat loss, and it goes on
                         and off on a daily rhythm. Reading the switch once and assuming that state
@@ -852,6 +875,34 @@
                         being left off shows up within a week. An hour with too little history
                         &mdash; fewer than about three days &mdash; defers to the switch instead of
                         being guessed at.</p>
+
+                    <h3 id="managed-loads-circuit" data-level="expert">When the heat pump's controller switches the circuit off</h3>
+                    <p data-level="expert">A weather-compensated controller has the last word over its heating circuit.
+                        In summer mode it shuts the circuit down once the damped outdoor
+                        temperature is above its threshold, and then no release, setpoint or room
+                        thermostat makes the pump heat. EOS Connect cannot see that on its own: it
+                        would keep planning heat into hours that deliver none, size the battery
+                        around a load that never appears, and report the house as released while
+                        it cools.</p>
+                    <p data-level="expert">Point <strong>Circuit Sensor</strong> at whatever reports the circuit's state
+                        &mdash; typically the circuit's operating state as a bus gateway or Modbus
+                        integration exposes it, which for example reads <code>off</code> in the
+                        summer shutdown and <code>heating</code> otherwise, also while the pump is
+                        idle. Values that mean off for your controller (say <code>summer</code>)
+                        go into <strong>Circuit Off States</strong>, comma-separated. While it
+                        reads one of the <strong>Circuit Off States</strong> (default
+                        <code>off</code>) nothing is planned or offered to the optimizer, the
+                        release is withdrawn (a minimum-runtime hold included) and the reason reads
+                        <em>heating circuit off</em>; the energy the house would need stays on the
+                        card. The first cycle after it reads otherwise plans again. A gateway that
+                        drops out reads <code>unavailable</code>; that is not an off circuit, so the
+                        last definite state stands for 30 minutes before the circuit counts as on
+                        again.</p>
+                    <div class="alert alert-info" data-level="expert">
+                        <p>Use a state that only goes off when the controller itself blocks the
+                            circuit. A signal that also reads off whenever the room is warm enough
+                            would stop the plan from ever asking for heat.</p>
+                    </div>
 
                     <h3 id="managed-loads-ambient">Outdoor loads need an outdoor temperature</h3>
                     <p>A pool's losses and its heat pump's efficiency both turn on the air

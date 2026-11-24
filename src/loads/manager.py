@@ -112,6 +112,16 @@ ORIGIN_SELF = "self"
 STANDBY_SUFFIX = "::standby"
 
 
+def _cop_air_sensor(item):
+    """The entity naming a heat pump's own air, or '' where the COP uses the ambient."""
+    return str((item.config or {}).get("cop_air_sensor") or "").strip()
+
+
+def _cop_air_key(load_id):
+    """Where a load's heat-pump-air offsets live beside its ambient ones."""
+    return f"{load_id}:cop_air"
+
+
 def standby_contribution_id(load_id):
     """The registry key a load's standby contribution is published under."""
     return f"{load_id}{STANDBY_SUFFIX}"
@@ -334,7 +344,8 @@ class ManagedLoadManager:
         weather - which is the one thing it exists to do.
         """
         return any(
-            item.enabled and uses_outdoor_ambient(item.type) for item in self.instances
+            item.enabled and (uses_outdoor_ambient(item.type) or _cop_air_sensor(item))
+            for item in self.instances
         )
 
     # -- the optimizer-facing call ---------------------------------------------------------
@@ -961,6 +972,9 @@ class ManagedLoadManager:
         readings = self._read_sensors(item)
         measured, forecast_now = self._ambient_inputs(item, ctx_base, readings)
         ambient, ambient_source = self._ambient_series(item, ctx_base, readings)
+        cop_air, cop_air_measured, cop_air_forecast = self._cop_air_series(
+            item, ctx_base, readings
+        )
         return DemandContext(
             now=ctx_base.now,
             anchor=ctx_base.anchor,
@@ -976,6 +990,9 @@ class ManagedLoadManager:
             ambient_source=ambient_source,
             ambient_measured_c=measured,
             ambient_forecast_c=forecast_now,
+            cop_air_temp_c=cop_air,
+            cop_air_measured_c=cop_air_measured,
+            cop_air_forecast_c=cop_air_forecast,
             readings=readings,
         )
 
@@ -1044,6 +1061,34 @@ class ManagedLoadManager:
             self._warn_missing_ambient(item)
         return [fallback_ambient_c(item.type)] * ctx.slot_count, AMBIENT_FALLBACK
 
+    def _cop_air_series(self, item, ctx, readings):
+        """
+        The air the heat pump itself draws from, one value per slot - or nothing.
+
+        Only for an instance with a ``cop_air_sensor``: an indoor store heated by an
+        outdoor air-source heat pump. Its losses go to the room it stands in, its COP
+        follows the weather, and one ambient series cannot be both. The outdoor
+        forecast, shifted onto this sensor hour by hour exactly like an outdoor load's
+        ambient; the reading held flat where there is no forecast; nothing where there
+        is neither, so the COP falls back to the surroundings as before.
+
+        Returns ``(series, measured, forecast_now)``.
+        """
+        if not _cop_air_sensor(item):
+            return [], None, None
+        measured = self._reading_as_float(readings.get("cop_air_sensor"), None)
+        hourly = self.sources.temperature_forecast() or []
+        if hourly:
+            raw = self._expand_hourly(hourly, ctx.slot_count)
+            slot = min(max(0, ctx.current_slot), len(raw) - 1)
+            series, _ = self._corrected_forecast(
+                item, raw, measured, ctx, key=_cop_air_key(item.id)
+            )
+            return series, measured, raw[slot]
+        if measured is not None:
+            return [measured] * ctx.slot_count, measured, None
+        return [], None, None
+
     @staticmethod
     def _sensor_ambient(readings):
         """The instance's own outdoor reading, or None."""
@@ -1055,7 +1100,7 @@ class ManagedLoadManager:
         except (ValueError, IndexError):
             return None
 
-    def _corrected_forecast(self, item, raw, measured, ctx):
+    def _corrected_forecast(self, item, raw, measured, ctx, key=None):
         """
         The forecast shifted onto this site, hour by hour.
 
@@ -1065,15 +1110,19 @@ class ManagedLoadManager:
         ends, and at the current cap it applied a night-time correction to tomorrow's
         afternoon.
         """
-        bias = self._ambient_bias.get(item.id)
+        # *key* keeps a second series of the same instance - the heat pump's own air -
+        # apart from its ambient: its own offsets, its own nowcast, its own trace.
+        key = key or item.id
+        bias = self._ambient_bias.get(key)
         if bias is None:
-            bias = self._ambient_bias[item.id] = AmbientBias()
+            bias = self._ambient_bias[key] = AmbientBias()
 
         slot = min(max(0, ctx.current_slot), len(raw) - 1)
         forecast_now = raw[slot]
         if measured is not None:
             bias.observe(ctx.now, measured, forecast_now)
-            self._warn_if_implausible(item, measured - forecast_now)
+            if key == item.id:
+                self._warn_if_implausible(item, measured - forecast_now)
 
         slots_per_day = max(1, 86400 // ctx.time_frame_base)
         slots_per_hour = max(1, ctx.slots_per_hour())
@@ -1093,14 +1142,16 @@ class ManagedLoadManager:
         # is a measurement and stands, but a sensor reporting nonsense must not drag a
         # two-day horizon with it.
         if measured is not None and 0 <= slot < len(corrected):
-            residual = self._smoothed_residual(item, ctx, measured - corrected[slot])
+            residual = self._smoothed_residual(
+                item, ctx, measured - corrected[slot], key=key
+            )
             projected = max(-MAX_OFFSET_K, min(MAX_OFFSET_K, residual))
             hours_per_slot = ctx.time_frame_base / 3600.0
             for index in range(slot, len(corrected)):
                 ahead = (index - slot) * hours_per_slot
                 corrected[index] += projected * 0.5 ** (ahead / NOWCAST_HALF_LIFE_HOURS)
 
-        self._ambient_trace[item.id] = (list(raw), list(corrected))
+        self._ambient_trace[key] = (list(raw), list(corrected))
 
         source = AMBIENT_CORRECTED if bias.offset(
             (slot % slots_per_day) // slots_per_hour
@@ -1157,7 +1208,7 @@ class ManagedLoadManager:
             "target_c": None if target is None else round(float(target), 2),
         }
 
-    def _smoothed_residual(self, item, ctx, gap):
+    def _smoothed_residual(self, item, ctx, gap, key=None):
         """
         Today's departure from the typical day, filtered.
 
@@ -1170,7 +1221,8 @@ class ManagedLoadManager:
         something, or a fixed clock would freeze the estimate forever; one poll
         interval is the floor.
         """
-        previous = self._ambient_residual.get(item.id)
+        key = key or item.id
+        previous = self._ambient_residual.get(key)
         if previous is None:
             smoothed = gap
         else:
@@ -1181,7 +1233,7 @@ class ManagedLoadManager:
             )
             keep = 0.5 ** (minutes / RESIDUAL_HALF_LIFE_MIN)
             smoothed = value * keep + gap * (1.0 - keep)
-        self._ambient_residual[item.id] = (ctx.now, smoothed)
+        self._ambient_residual[key] = (ctx.now, smoothed)
         return smoothed
 
     def ambient_series_state(self, item):
@@ -1506,12 +1558,27 @@ class ManagedLoadManager:
                 "solar_w": self._forecast_solar_w(ctx),
                 "ambient_measured_c": ctx.ambient_measured_c,
                 "ambient_forecast_c": ctx.ambient_forecast_c,
+                # The heat pump's own air, where it has one: what the COP is fitted
+                # against, and the two inputs its offsets are relearned from.
+                "cop_air_c": (
+                    ctx.cop_air_temp_c[min(ctx.current_slot, len(ctx.cop_air_temp_c) - 1)]
+                    if ctx.cop_air_temp_c else None
+                ),
+                "cop_air_measured_c": ctx.cop_air_measured_c,
+                "cop_air_forecast_c": ctx.cop_air_forecast_c,
             }
         except (ValueError, IndexError, TypeError):
             return
 
         if sample["ambient_c"] is None:
             return
+
+        # Whether the heat pump's controller had the circuit off, where a circuit
+        # sensor says so: a sample taken then shows a pump that was not allowed to
+        # run, not one that chose not to, and anything learning from runs can tell
+        # the two apart. Only recorded where the sensor is configured.
+        if getattr(item.model, "circuit_sensor", "") and hasattr(item.model, "circuit_off"):
+            sample["circuit_off"] = bool(item.model.circuit_off(ctx)[0])
 
         self.stats.samples_recorded += 1
         self._remember_medium(item.id, sample.get("timestamp"), sample.get("medium_c"))
@@ -1571,17 +1638,25 @@ class ManagedLoadManager:
         Samples written before the measurement was stored simply carry neither field and
         are skipped, so an upgraded install relearns over a day rather than failing.
         """
-        if not samples or not uses_outdoor_ambient(item.type):
+        if not samples:
             return
-        bias = self._ambient_bias.get(item.id)
-        if bias is None:
-            bias = self._ambient_bias[item.id] = AmbientBias()
-        for sample in samples:
-            bias.observe(
-                sample.get("timestamp"),
-                sample.get("ambient_measured_c"),
-                sample.get("ambient_forecast_c"),
+        series = []
+        if uses_outdoor_ambient(item.type):
+            series.append((item.id, "ambient_measured_c", "ambient_forecast_c"))
+        if _cop_air_sensor(item):
+            series.append(
+                (_cop_air_key(item.id), "cop_air_measured_c", "cop_air_forecast_c")
             )
+        for key, measured_field, forecast_field in series:
+            bias = self._ambient_bias.get(key)
+            if bias is None:
+                bias = self._ambient_bias[key] = AmbientBias()
+            for sample in samples:
+                bias.observe(
+                    sample.get("timestamp"),
+                    sample.get(measured_field),
+                    sample.get(forecast_field),
+                )
 
     def push(self, entry_id, payload, source=SOURCE_API):
         """
