@@ -28,7 +28,7 @@ and decides nothing.
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:  # pytz is the zone flavour the interfaces build; zoneinfo needs no help
     from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
@@ -113,6 +113,61 @@ def local_midnight(tz, now=None):
             return tz.localize(naive, is_dst=True)
     # zoneinfo and friends: fold=0 already selects the first occurrence.
     return naive.replace(tzinfo=tz, fold=0)
+
+
+def slots_between(earlier_anchor, later_anchor, time_frame_base):
+    """
+    Whole slots from one midnight anchor to another - 96 across an ordinary night at
+    quarter hours, 92 or 100 across a DST night. 0 when either anchor is missing.
+
+    When only one of them carries a zone (a part of the program configured without a
+    time zone counts naive local time) the two are compared as wall-clock times.
+    """
+    if earlier_anchor is None or later_anchor is None:
+        return 0
+    early_aware = earlier_anchor.tzinfo is not None
+    late_aware = later_anchor.tzinfo is not None
+    if early_aware and late_aware:
+        # Through UTC: two datetimes sharing one zoneinfo object subtract as wall
+        # time, which would make a 25-hour night 24 hours long.
+        earlier_anchor = earlier_anchor.astimezone(timezone.utc)
+        later_anchor = later_anchor.astimezone(timezone.utc)
+    elif early_aware or late_aware:
+        earlier_anchor = earlier_anchor.replace(tzinfo=None)
+        later_anchor = later_anchor.replace(tzinfo=None)
+    seconds = (later_anchor - earlier_anchor).total_seconds()
+    return int(round(seconds / float(time_frame_base)))
+
+
+def parse_anchor(value):
+    """A midnight anchor from a datetime or its ISO text, or None when there is none."""
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def reanchor(series, shift, fill, length=None):
+    """
+    *series* indexed from an anchor *shift* slots later, at the same length.
+
+    Slot-indexed arrays count from a local midnight, and two parts of the program can
+    hold different midnights for a few minutes after the day turns. A positive *shift*
+    moves to the later anchor: the slots before it are dropped and *fill* pads the end.
+    A negative one moves to an earlier anchor and pads the front instead.
+    """
+    values = list(series or [])
+    length = len(values) if length is None else int(length)
+    if shift > 0:
+        values = values[shift:]
+    elif shift < 0:
+        values = [fill] * (-shift) + values
+    values = values[:length]
+    return values + [fill] * (length - len(values))
 
 
 def place_on_grid(entries, anchor, slot_count, slot_seconds, kind):

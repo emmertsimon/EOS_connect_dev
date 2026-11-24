@@ -17,6 +17,11 @@ import logging
 import math
 from datetime import timedelta
 
+try:  # running from src/ — src/ is on sys.path
+    from timeseries_grid import reanchor
+except ImportError:  # imported as src.loads (tests)
+    from ..timeseries_grid import reanchor
+
 from .contribution import (
     KIND_PROFILE,
     SOURCE_API,
@@ -430,6 +435,18 @@ class ManagedLoad:
         plan = self.last_plan if plan is None else plan
         efficiency = self.last_demand.efficiency if self.last_demand else None
         return slot_efficiency.effective_wh(plan, efficiency)
+
+    def reanchor_plan(self, shift, length):
+        """
+        Move the plan in force onto a midnight *shift* slots later (or earlier).
+
+        Plans are indexed from the midnight of the context they were made in. When the
+        manager's context moves to a new day, a plan it keeps - the optimizer's, which
+        lives on across cycles until the next schedule - has to move with it, or every
+        slot it names is read a day early.
+        """
+        if shift and self.last_plan:
+            self.last_plan = reanchor(self.last_plan, shift, 0.0, length)
 
     def adopt_schedule(self, schedule, ctx, cost=None):
         """
