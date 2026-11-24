@@ -1336,8 +1336,15 @@ class ControlsManager {
             };
         }
 
-        const detail = `Heat loss from ${loss} cooling and efficiency from ${cop} `
-            + 'heating periods, measured rather than assumed.';
+        // A loss the observations could not yet explain is held at the configured
+        // value; saying it was measured would present a guess as a fit. Older states
+        // carry no flag and keep the previous wording.
+        const detail = model.loss_identified === false
+            ? `Efficiency from ${cop} heating periods. The heat loss is still the `
+                + `configured value &mdash; ${loss} cooling periods do not yet explain `
+                + 'it well enough to measure.'
+            : `Heat loss from ${loss} cooling and efficiency from ${cop} `
+                + 'heating periods, measured rather than assumed.';
 
         // A poor fit after the observations are in is not "keep waiting" - it is
         // either something still held at a guess, which the notes below name, or

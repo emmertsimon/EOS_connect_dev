@@ -150,10 +150,80 @@ WEIGHT_HALF_LIFE_HOURS = 7 * 24.0
 # physical bounds and from holding the slope when the ambient never varied, not from
 # leaning on the configuration.
 RIDGE_SAMPLES = 2.0
+# Windows the loss needs before the fit may move it off the configured value. A store
+# yields a usable window rarely - a house's room average moves by tenths of a kelvin
+# while tens of kWh/K of mass sit behind it - and a handful of such windows can put the
+# fitted loss anywhere within a factor of several from one restart to the next. Below
+# this the loss is held at its prior exactly like an unidentified cover or sun term.
+LOSS_FIT_MIN_ROWS = 12
+# Share of the windows' heat flow a fitted loss has to explain to be kept, measured as
+# 1 - RMS(residual) / RMS(signal) - the same figure as `fit_quality`. It is uncentred
+# (the signal is not taken about its mean), so it reads higher than an R2 would: 0.3
+# here is an R2 of about 1 - 0.7**2 = 0.51 on a signal centred on zero. Below it the
+# windows are noise as far as the loss is concerned, and the loss with them.
+LOSS_FIT_MIN_QUALITY = 0.3
 
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _rms_error(theta, weights, design, targets):
+    """Weighted RMS of what *theta* fails to explain, in watts; None without weight."""
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return None
+    error = 0.0
+    for i, weight in enumerate(weights):
+        predicted = sum(design[i][col] * theta[col] for col in range(len(theta)))
+        error += weight * (targets[i] - predicted) ** 2
+    return math.sqrt(error / total_weight)
+
+
+def _rms(weights, targets):
+    """Weighted RMS of what the model is trying to explain, in watts; None without weight."""
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return None
+    return math.sqrt(sum(w * targets[i] ** 2 for i, w in enumerate(weights)) / total_weight)
+
+
+def _explained(theta, weights, design, targets):
+    """
+    Share of the targets *theta* accounts for, 0 to 1: 1 - RMS(residual) / RMS(signal).
+
+    Uncentred, like `ThermalCalibrator.fit_quality`, which reports the same figure for
+    the bounded estimate - see LOSS_FIT_MIN_QUALITY for how it compares to an R2.
+    """
+    signal = _rms(weights, targets)
+    if not signal:
+        return 0.0
+    return max(0.0, 1.0 - _rms_error(theta, weights, design, targets) / signal)
+
+
+def _settled_estimate(solve, pinned, fit):
+    """
+    The refit's estimate after the rules that re-solve it, and whether the loss in it
+    was fitted: ``(estimate, loss_identified)``, ``(None, False)`` when singular.
+
+    *solve* takes a list of pinned columns; *pinned* is the refit's own and may be
+    changed here; *fit* is ``(weights, design, targets)``, one entry per window.
+    """
+    if len(fit[0]) < LOSS_FIT_MIN_ROWS:
+        pinned[2] = pinned[3] = True
+    estimate = solve(pinned)
+    if estimate is None:
+        return None, False
+    loss_free = not (pinned[2] and pinned[3])
+    if loss_free and _explained(estimate, *fit) < LOSS_FIT_MIN_QUALITY:
+        # A loss the windows cannot explain is not a measurement of the loss: keep the
+        # configured one rather than whatever the noise happened to average to.
+        held_loss = list(pinned)
+        held_loss[2] = held_loss[3] = True
+        refit = solve(held_loss)
+        if refit is not None:
+            return refit, False
+    return estimate, loss_free
 
 
 def _observed_ambient(sample):
@@ -319,6 +389,8 @@ class ThermalCalibrator:
         self.slope_identified = False
         self.cover_identified = False
         self.solar_identified = False
+        # Whether the last fit moved the loss off the configured value - see refit.
+        self.loss_identified = False
         self._thin_state = None
         self.residual_w = None
         self.signal_w = None
@@ -703,17 +775,25 @@ class ThermalCalibrator:
             pinned[2 if self._thin_state == "open" else 3] = True
         if not self.solar_identified:
             pinned[4] = True
-        for col in range(UNKNOWNS):
-            strength = ridge * 1e9 if pinned[col] else ridge
-            normal[col][col] += strength
-            rhs[col] += strength * prior_scaled[col]
 
-        solution = _solve(normal, rhs)
-        if solution is None:
+        def solve(pins):
+            system = [list(row) for row in normal]
+            right = list(rhs)
+            for col in range(UNKNOWNS):
+                strength = ridge * 1e9 if pins[col] else ridge
+                system[col][col] += strength
+                right[col] += strength * prior_scaled[col]
+            found = _solve(system, right)
+            return None if found is None else [
+                found[col] / scales[col] for col in range(UNKNOWNS)
+            ]
+
+        estimate, self.loss_identified = _settled_estimate(
+            solve, pinned, (weights, design, targets)
+        )
+        if estimate is None:
             logger.debug("[LOADS] calibration fit is singular - keeping the last estimate")
             return False
-
-        estimate = [solution[col] / scales[col] for col in range(UNKNOWNS)]
         self._apply(estimate, rows, weights, design, targets)
         if metered is not None:
             self.cop_source = "heat_meter"
@@ -815,24 +895,14 @@ class ThermalCalibrator:
         pool that pinned the reported confidence near 0.4 whatever the data did, which
         read as a calibration that had stopped learning.
         """
-        theta = self._theta()
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            return None
-        error = 0.0
-        for i, weight in enumerate(weights):
-            predicted = sum(design[i][col] * theta[col] for col in range(UNKNOWNS))
-            error += weight * (targets[i] - predicted) ** 2
-        return round(math.sqrt(error / total_weight), 1)
+        error = _rms_error(self._theta(), weights, design, targets)
+        return None if error is None else round(error, 1)
 
     @staticmethod
     def _signal(weights, targets):
         """Weighted RMS of what the model is trying to explain, in watts."""
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            return None
-        energy = sum(w * targets[i] ** 2 for i, w in enumerate(weights))
-        return round(math.sqrt(energy / total_weight), 1)
+        signal = _rms(weights, targets)
+        return None if signal is None else round(signal, 1)
 
     def _theta(self):
         """The current estimate as (a, b, k_open, k_covered)."""
@@ -914,6 +984,7 @@ class ThermalCalibrator:
             "slope_identified": self.slope_identified,
             "cover_identified": self.cover_identified,
             "solar_identified": self.solar_identified,
+            "loss_identified": self.loss_identified,
             "residual_w": self.residual_w,
             "signal_w": self.signal_w,
             "fit_quality": self.fit_quality(),
@@ -948,6 +1019,12 @@ class ThermalCalibrator:
         self._restored_loss_samples = max(0, int(state.get("loss_samples", 0) or 0))
         self._restored_cop_samples = max(0, int(state.get("cop_samples", 0) or 0))
         self.slope_identified = bool(state.get("slope_identified", False))
+        # A state saved before the flag existed held a fitted loss whenever it held a
+        # loss other than the configured one.
+        self.loss_identified = bool(state.get(
+            "loss_identified",
+            not math.isclose(self.loss_coefficient, self.configured_loss_coefficient),
+        ))
         restored = state.get("confidence")
         if isinstance(restored, (int, float)):
             self._restored_confidence = _clamp(float(restored), 0.0, 1.0)

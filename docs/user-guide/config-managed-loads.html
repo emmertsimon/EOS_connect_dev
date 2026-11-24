@@ -675,6 +675,15 @@
                             refit until the predicted standing losses made the target unreachable. Both
                             states have to actually occur before they separate; until then the
                             calibration panel says the cover is still assumed rather than measured.</p>
+                        <p>The loss itself is held at the configured value until the history can
+                            carry it: below twelve windows, and whenever a fitted loss explains less
+                            than 30&nbsp;% of the windows&rsquo; heat flow (one minus the residual
+                            over the signal, both as RMS &mdash; roughly an R&sup2; of 0.5), the fit
+                            is solved again with the loss pinned. A house yields such windows rarely
+                            and each is noisy, and a loss fitted to a few of them moved by a factor
+                            of several between restarts. While the loss is held, the calibration
+                            panel says so and the API reports <code>loss_identified: false</code>.
+                            This applies to every store &mdash; pool, hot water and house alike.</p>
                         <p>The fit learns from the <strong>sensor</strong>, never from the forecast.
                             Both are recorded on every sample, and they are for different jobs: the
                             bias-corrected forecast is the right input for a slot nobody has measured
