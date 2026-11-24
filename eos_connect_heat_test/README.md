@@ -8,7 +8,8 @@ Wärmepumpe (`feature/modulating-heat-pump`, Teillast-COP) und der Leistungskurv
 (`feature/heating-power-curve`: WP nur an/aus, Leistung pro Slot aus einer aus den Läufen
 gelernten Formel über Außen- und Haustemperatur) und dem Soft-/Hard-Limit für Speicher
 (`feature/dhw-soft-hard-limit`: unter `soft_limit_temp_c` eine Ladung im nächsten Fenster trotz
-Preisgrenze, unter `frost_protection_temp_c` sofort) obendrauf.
+Preisgrenze, unter `frost_protection_temp_c` sofort; mit 0,3 K Hysterese `limit_hysteresis_k`
+und Überbrückung eines bis 15 min ausgefallenen Temperatursensors) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).
