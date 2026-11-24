@@ -2830,6 +2830,24 @@ _ALL_FIELDS: list[FieldDef] = [
         display_group="Temperature",
     ),
     FieldDef(
+        key="managed_loads.cop_air_sensor",
+        field_type="sensor",
+        default="",
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Outdoor air the heat pump draws its heat from, where that is not the "
+            "store's surroundings - a hot water tank indoors heated by an air-source "
+            "heat pump. The efficiency (COP) then follows the outdoor forecast, matched "
+            "to this sensor hour by hour, while the losses still go to the surroundings. "
+            "Leave empty where it is the same air (pool, house)"
+        ),
+        labels=["restart_required"],
+        help_url="config-managed-loads.html#managed-loads-cop-air",
+        depends_on={"type": MANAGED_LOAD_THERMAL_TYPES},
+        display_group="Temperature",
+    ),
+    FieldDef(
         key="managed_loads.volume_m3",
         field_type="float",
         default=30.0,

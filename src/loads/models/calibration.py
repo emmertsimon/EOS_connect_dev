@@ -177,6 +177,31 @@ def _observed_ambient(sample):
     return float(sample["ambient_c"])
 
 
+def _observed_cop_air(sample):
+    """
+    The heat pump's own air for one sample, or None where it has none of its own.
+
+    The measurement first, for the same reason as `_observed_ambient`.
+    """
+    for key in ("cop_air_measured_c", "cop_air_c"):
+        value = sample.get(key)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _cop_temperature(row):
+    """The air a row's COP belongs to: the heat pump's own, else the surroundings."""
+    value = row.get("cop_air_c")
+    return row["ambient_c"] if value is None else value
+
+
 def _window_solar_w(counters, solars, span_hours):
     """
     Mean irradiance proxy over the window, in watts.
@@ -505,10 +530,12 @@ class ThermalCalibrator:
             return None
 
         ambients, powers, covers, solars, counters = [], [], [], [], []
+        cop_airs = []
         heat_ends = (first.get("heat_counter_kwh"), last.get("heat_counter_kwh"))
         for sample in window:
             try:
                 ambients.append(_observed_ambient(sample))
+                cop_airs.append(_observed_cop_air(sample))
                 powers.append(float(sample.get("power_w", 0.0) or 0.0))
                 covers.append(1.0 if _was_covered(sample) else 0.0)
                 solars.append(max(0.0, float(sample.get("solar_w", 0.0) or 0.0)))
@@ -552,6 +579,12 @@ class ThermalCalibrator:
             # above the old 50 W guess from reading as permanently running.
             "power_w": sum(powers) / len(powers) if running else 0.0,
             "ambient_c": ambient,
+            # Only where every sample had it: a window half on the tank's room and half
+            # on the outdoor air describes neither.
+            "cop_air_c": (
+                sum(cop_airs) / len(cop_airs)
+                if cop_airs and None not in cop_airs else None
+            ),
             "drive_k": (medium_last + medium_first) / 2.0 - ambient,
             # The share of the window the store spent covered, which is what splits the
             # loss between the two coefficients. Not the multiplier: feeding back a
@@ -584,7 +617,7 @@ class ThermalCalibrator:
         on_rows = [row for row in rows if self._is_running_reading(row["power_w"])]
         span = 0.0
         if on_rows:
-            temps = [row["ambient_c"] for row in on_rows]
+            temps = [_cop_temperature(row) for row in on_rows]
             span = max(temps) - min(temps)
         self.slope_identified = span >= COP_FIT_MIN_SPAN_K
 
@@ -630,7 +663,7 @@ class ThermalCalibrator:
             share = row["covered_share"]
             design.append((
                 row["power_w"],
-                row["ambient_c"] * row["power_w"],
+                _cop_temperature(row) * row["power_w"],
                 -drive * (1.0 - share),
                 -drive * share,
                 row.get("solar_w", 0.0),
@@ -735,7 +768,8 @@ class ThermalCalibrator:
         the slope needed the first cold spell.
         """
         pairs = [
-            (row["ambient_c"], row["heat_w"] / row["power_w"], row["power_w"] * weight)
+            (_cop_temperature(row), row["heat_w"] / row["power_w"],
+             row["power_w"] * weight)
             for row, weight in zip(rows, weights)
             if row.get("heat_w") and row["power_w"] >= IDLE_POWER_W
         ]
