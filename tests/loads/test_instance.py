@@ -2290,3 +2290,45 @@ def test_the_projection_stops_where_the_appliance_does(make_manager, installatio
                  if v is not None]
     assert max(projected) <= 90.0 + 1e-6, f"overshot to {max(projected):.1f}"
     assert max(projected) > 80.0, "it should still reach the target"
+
+
+# --- what a start costs ------------------------------------------------------------------
+
+def test_an_unpriced_start_keeps_the_tie_breaker(make_manager, installation):
+    manager = make_manager([dict(POOL, max_price_ct_kwh=25.0)])
+    manager.external_scheduler = True
+    _run(manager, installation, water_c=20.0)
+
+    record = manager.schedulable()[0]
+    assert record["start_cost_eur"] > 0
+    assert record["start_wear_eur"] == 0
+    assert record["start_loss_wh"] == 0
+
+
+def test_a_priced_start_replaces_the_tie_breaker(make_manager, installation):
+    """
+    Wear and loss make a contiguous run the cheaper plan by themselves. The tie-breaker
+    is scaled by the price limit, which a store planned by temperature does not use,
+    and stacking it on top would price the start twice.
+    """
+    manager = make_manager([dict(POOL, max_price_ct_kwh=25.0, start_wear_ct=15,
+                                 start_loss_kwh=0.5)])
+    manager.external_scheduler = True
+    _run(manager, installation, water_c=20.0)
+
+    record = manager.schedulable()[0]
+    assert record["start_cost_eur"] == 0
+    assert record["start_wear_eur"] == pytest.approx(0.15)
+    assert record["start_loss_wh"] == pytest.approx(500.0)
+
+
+@pytest.mark.parametrize("bad", [-5, "abc", None, float("nan")])
+def test_a_start_cost_that_makes_no_sense_is_off(make_manager, installation, bad):
+    manager = make_manager([dict(POOL, start_wear_ct=bad, start_loss_kwh=bad)])
+    manager.external_scheduler = True
+    _run(manager, installation, water_c=20.0)
+
+    record = manager.schedulable()[0]
+    assert record["start_wear_eur"] == 0
+    assert record["start_loss_wh"] == 0
+    assert record["start_cost_eur"] > 0

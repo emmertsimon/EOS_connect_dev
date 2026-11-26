@@ -518,6 +518,34 @@
                             yesterday's figure.</p>
                     </div>
 
+                    <h3 id="managed-loads-start-cost">What a start costs</h3>
+                    <p><strong>Min Runtime Minutes</strong> bounds how short a run may be, and
+                        the rest between two runs is held to the same length. Within that the
+                        built-in optimizer is free to split a run wherever a pause saves money.
+                        By default a start carries only a small tie-breaker &mdash; half a
+                        slot's energy at the price limit &mdash; which keeps the plan from
+                        scattering a run across equally priced hours, but a pause that saves a
+                        few cent is still taken. For a compressor that is often the wrong trade.
+                        Two settings price a start properly:</p>
+                    <ul>
+                        <li><strong>Start Wear Ct</strong> &mdash; a fixed amount per start for
+                            wear. It does not depend on the tariff, and it is counted in the
+                            plan's cost the way the battery's wear is.</li>
+                        <li><strong>Start Loss Kwh</strong> &mdash; electricity a start draws
+                            without delivering anything: the compressor ramping up, the circuit
+                            coming up to temperature. It is bought in the slot the run begins
+                            like any other energy &mdash; at that slot's tariff, from the battery
+                            or from surplus PV &mdash; so it costs more in a dear hour and almost
+                            nothing in the sun.</li>
+                    </ul>
+                    <p>A pause is then planned only where it saves more than wear plus loss.
+                        Setting either one replaces the tie-breaker; leave both at
+                        <strong>0</strong> for the previous behaviour. A store planned by
+                        temperature keeps its comfort floor either way: a start priced high
+                        moves heat to other hours, it does not let the rooms go cold. The plan
+                        summary reports <em>planned_runs</em>, the number of runs left in the
+                        horizon.</p>
+
                     <h3 id="managed-loads-temperature">Planning a store by its temperature</h3>
                     <p>Planned by <strong>energy</strong>, a heated store works out how much it
                         will need over the next two days and that amount is placed in the cheapest
