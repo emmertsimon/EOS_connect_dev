@@ -704,6 +704,8 @@ class LocalEVOptBackend(EVOptBackend):
                     if entry.get("must_slots") else None
                 ),
                 start_cost_eur=float(entry.get("start_cost_eur", 0) or 0),
+                start_wear_eur=max(0.0, float(entry.get("start_wear_eur", 0) or 0)),
+                start_loss_wh=max(0.0, float(entry.get("start_loss_wh", 0) or 0)),
                 max_slots_per_day=max(0, int(entry.get("max_slots_per_day", 0) or 0)),
                 day_index=self.to_solver_slots(entry.get("day_index"), fill=-1),
                 committed_on_slots=max(0, int(entry.get("committed_on_slots", 0) or 0)),

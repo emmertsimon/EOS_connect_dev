@@ -15,7 +15,10 @@ Eigenwärme aus seinen 12-h-Vorhersagen, übernommen nur wenn sie die letzten 2 
 vorhergesagt hätten) und dem Fix für Prognose-Ausfälle (`fix/pv-forecast-outage-fallback`:
 bei nicht erreichbarem Prognosedienst nimmt jede PV-Fläche ihre eigene letzte Kurve statt der
 Summe, keine Vervielfachung mehr; die Außentemperatur bleibt bei der letzten echten Prognose
-statt 15 °C; zerschossene Prognosestunden zählen nicht in die PV-Autoskalierung) obendrauf.
+statt 15 °C; zerschossene Prognosestunden zählen nicht in die PV-Autoskalierung) und den
+Startkosten (`feature/heat-pump-start-cost`: `start_wear_ct` als fester Verschleiß pro Start,
+`start_loss_kwh` als Anlaufverlust, den der Optimierer im Startslot zu dessen Preis, aus dem
+Akku oder aus PV kauft; ersetzt den kleinen Gleichstand-Brecher, beide 0 = wie bisher) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).
