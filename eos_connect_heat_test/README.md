@@ -12,7 +12,10 @@ Preisgrenze, unter `frost_protection_temp_c` sofort; mit 0,3 K Hysterese `limit_
 und Überbrückung eines bis 15 min ausgefallenen Temperatursensors) und dem Hauslernen
 (`feature/learn-house-capacity`: das Haus lernt Speicherkapazität, Wärmeverlust, Sonnen- und
 Eigenwärme aus seinen 12-h-Vorhersagen, übernommen nur wenn sie die letzten 2 Tage besser
-vorhergesagt hätten) obendrauf.
+vorhergesagt hätten) und dem Fix für Prognose-Ausfälle (`fix/pv-forecast-outage-fallback`:
+bei nicht erreichbarem Prognosedienst nimmt jede PV-Fläche ihre eigene letzte Kurve statt der
+Summe, keine Vervielfachung mehr; die Außentemperatur bleibt bei der letzten echten Prognose
+statt 15 °C; zerschossene Prognosestunden zählen nicht in die PV-Autoskalierung) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).
