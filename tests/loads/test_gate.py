@@ -164,3 +164,79 @@ def test_status_reports_without_changing_the_decision():
     assert status["released"] is True
     assert status["min_runtime_minutes"] == 15
     assert gate.released is True
+
+
+# --- after a restart ---------------------------------------------------------------------
+
+def _journal(*entries):
+    """(minutes before T0, released) pairs, returned newest first like the store."""
+    rows = [{"timestamp": _at(-minutes).isoformat(), "released": released}
+            for minutes, released in entries]
+    return sorted(rows, key=lambda row: row["timestamp"], reverse=True)
+
+
+def _every_three(newest, oldest, released):
+    """A stretch of the journal as it is written: one decision every three minutes."""
+    return [(minutes, released) for minutes in range(newest, oldest + 1, 3)]
+
+
+def test_a_run_in_progress_is_restored_with_its_start():
+    gate = ReleaseGate("house", min_runtime_minutes=90)
+    journal = _journal(*_every_three(1, 40, True), *_every_three(43, 61, False))
+    assert gate.restore(journal, T0, max_age_s=1200) is True
+    assert gate.released is True
+    assert gate.released_since == _at(-40)
+    # 40 of 90 minutes served: the hold carries the run over a plan that drops it.
+    result = gate.evaluate(planned=False, urgent=False, now=_at(10))
+    assert result["released"] is True
+    assert result["reason"] == REASON_MIN_RUNTIME
+
+
+def test_a_restored_run_ends_when_its_minimum_is_served():
+    gate = ReleaseGate("house", min_runtime_minutes=90)
+    gate.restore(_journal(*_every_three(1, 40, True)), T0, max_age_s=1200)
+    assert gate.evaluate(planned=False, urgent=False, now=_at(51))["released"] is False
+
+
+def test_a_rest_is_restored_with_its_start():
+    gate = ReleaseGate("house", min_runtime_minutes=90)
+    gate.restore(_journal(*_every_three(3, 30, False), (33, True)), T0, max_age_s=1200)
+    assert gate.released is False
+    assert gate.blocked_since == _at(-30)
+    assert gate.released_since is None
+
+
+def test_a_stale_journal_restores_nothing():
+    gate = ReleaseGate("house", min_runtime_minutes=90)
+    assert gate.restore(_journal((25, True), (40, True)), T0, max_age_s=1200) is False
+    assert gate.released is False
+
+
+def test_a_hole_in_the_journal_ends_the_run_it_describes():
+    """EOS was down for an hour before: the run behind the gap is not this one."""
+    gate = ReleaseGate("house", min_runtime_minutes=90)
+    gate.restore(_journal((1, True), (5, True), (70, True), (75, True)), T0,
+                 max_age_s=1200)
+    assert gate.released_since == _at(-5)
+
+
+def test_an_empty_or_unreadable_journal_restores_nothing():
+    gate = ReleaseGate("house")
+    assert gate.restore([], T0, max_age_s=1200) is False
+    assert gate.restore([{"timestamp": "garbage", "released": True}], T0,
+                        max_age_s=1200) is False
+
+
+def test_an_appliance_drawing_power_is_taken_as_running():
+    gate = ReleaseGate("house", min_runtime_minutes=90)
+    assert gate.adopt_running(2100.0, 50.0) is True
+    assert gate.released is True
+    # No start time is invented: no hold, the plan decides at once.
+    assert gate.evaluate(planned=False, urgent=False, now=T0)["released"] is False
+
+
+def test_an_idle_appliance_is_not_taken_as_running():
+    gate = ReleaseGate("house")
+    assert gate.adopt_running(20.0, 50.0) is False
+    assert gate.adopt_running(None, 50.0) is False
+    assert gate.released is False
