@@ -2332,3 +2332,62 @@ def test_a_start_cost_that_makes_no_sense_is_off(make_manager, installation, bad
     assert record["start_wear_eur"] == 0
     assert record["start_loss_wh"] == 0
     assert record["start_cost_eur"] > 0
+
+
+# --- a restart in the middle of a run ----------------------------------------------------
+
+def _store(tmp_path):
+    from src.config_web.store import ConfigStore
+    from src.persistence import ManagedLoadStore
+
+    config_store = ConfigStore(str(tmp_path / "c.db"))
+    config_store.open()
+    store = ManagedLoadStore(config_store)
+    store.ensure_schema()
+    return config_store, store
+
+
+def test_a_restart_picks_the_gate_up_from_the_journal(make_manager, installation,
+                                                      tmp_path):
+    """26.11., 21:34: a run 50 minutes in was read as stopped after an update."""
+    from datetime import datetime, timedelta
+    from tests.loads.conftest import BERLIN
+
+    # The journal is read back against the wall clock, so this test lives on it.
+    now = datetime.now(BERLIN).replace(microsecond=0)
+    config_store, store = _store(tmp_path)
+    for minutes in range(2, 51, 3):
+        store.record_decision("pool", now - timedelta(minutes=minutes),
+                              {"released": True, "reason": REASON_PLANNED})
+    manager = make_manager([dict(POOL, min_runtime_minutes=90)], store=store,
+                           clock=lambda: now)
+    manager.backfill()
+
+    gate = manager.instance("pool").gate
+    assert gate.released is True
+    assert gate.released_since == now - timedelta(minutes=50)
+    # 50 of 90 minutes served: the remaining 40 are held, not dropped by the next plan.
+    assert manager.instance("pool").commitment(manager._context())[0] > 0
+    assert manager.instance("pool").is_running() is True
+    config_store.close()
+
+
+def test_without_a_journal_a_running_appliance_counts_as_running(make_manager,
+                                                                  installation):
+    manager = make_manager([POOL])
+    manager.external_scheduler = True
+    _run(manager, installation, water_c=24.0, power_w=2100.0)
+
+    assert manager.instance("pool").is_running() is True
+    assert manager.schedulable()[0]["already_running"] is True
+
+
+def test_only_the_first_cycle_adopts_what_it_sees(make_manager, installation):
+    """Later, a pump drawing power while blocked is HA's doing, not EOS's run."""
+    manager = make_manager([POOL])
+    manager.external_scheduler = True
+    _run(manager, installation, water_c=24.0, power_w=0.0)
+    manager.instance("pool").gate.released = False
+    _run(manager, installation, water_c=24.0, power_w=2100.0)
+
+    assert manager.instance("pool").is_running() is False
