@@ -33,6 +33,7 @@ from .contribution import (
 from .injection import InjectionError, parse_push, profile_from_entries
 from .instance import ManagedLoad
 from .models.base import DemandContext
+from .models.calibration import IDLE_POWER_W
 from .presets import (
     EXTERNAL_TYPES, fallback_ambient_c, pulls_its_profile, uses_outdoor_ambient,
 )
@@ -185,6 +186,11 @@ UNCAPPED_VALUE_EUR_PER_WH = 0.01
 # another start only if it saves more than half a slot's worth of running.
 START_COST_SLOTS = 0.5
 
+# How old the newest journal entry may be for a restarted gate to pick up from it. A
+# restart takes under a minute and the journal is written every optimizer answer, so
+# twenty minutes covers a slow rebuild while never reviving a run from hours ago.
+GATE_RESTORE_MAX_AGE_S = 20 * 60
+
 
 def _padded(mask, length):
     """A feasibility mask at exactly the horizon length, missing slots allowed."""
@@ -296,6 +302,9 @@ class ManagedLoadManager:
         # Recent store temperatures, so the card can draw where the water has been as
         # well as where the plan takes it: id -> deque of (when, celsius).
         self._medium_history = {}
+        # Loads whose gate has had its one chance to be taken over at startup - from
+        # the journal, else from what the appliance is drawing.
+        self._gate_settled = set()
         self._stop = threading.Event()
         self._thread = None
 
@@ -482,6 +491,7 @@ class ManagedLoadManager:
             if uses_outdoor_ambient(item.type) and not self.has_pv_counter():
                 self._hint_pv_counter(item)
             self._record_sample(item, ctx)
+            self._adopt_running_at_startup(item, ctx)
             defer = self.external_scheduler and item.kind_is_contingent()
             if not defer:
                 item.fallback_active = False
@@ -1723,11 +1733,53 @@ class ManagedLoadManager:
                 self._remember_medium(
                     item.id, sample.get("timestamp"), sample.get("medium_c")
                 )
+        self.restore_gates()
         if restored:
             logger.info(
                 "[LOADS] calibration seeded from %d recorded sample pairs", restored
             )
         return restored
+
+    def restore_gates(self):
+        """
+        Give every gate back the state it had before the restart, from the journal.
+
+        Returns how many were restored. A gate the journal cannot speak for is left to
+        the first cycle, which takes the appliance as running if it measurably is.
+        """
+        if self.store is None:
+            return 0
+        now = self._now()
+        restored = 0
+        for item in self.instances:
+            if item.gate is None or item.id in self._gate_settled:
+                continue
+            try:
+                rows = self.store.load_decisions(item.id, hours=12, limit=500)
+            except Exception:  # pylint: disable=broad-except
+                logger.debug("[LOADS] could not read the journal of '%s'", item.id,
+                             exc_info=True)
+                continue
+            if item.gate.restore(rows, now, GATE_RESTORE_MAX_AGE_S):
+                self._gate_settled.add(item.id)
+                restored += 1
+        return restored
+
+    def _adopt_running_at_startup(self, item, ctx):
+        """First cycle only: an appliance drawing power counts as running."""
+        if item.id in self._gate_settled:
+            return
+        self._gate_settled.add(item.id)
+        # Thermal loads only: a heat pump on at startup is one EOS let run. A dishwasher
+        # drawing power is one somebody started, and releasing it says nothing useful.
+        model = getattr(item, "model", None)
+        if item.gate is None or not hasattr(model, "standby_threshold_w"):
+            return
+        reading = ctx.readings.get("power_sensor")
+        if reading is None:
+            return
+        threshold = model.standby_threshold_w or IDLE_POWER_W
+        item.gate.adopt_running(self._reading_as_float(reading, None), threshold)
 
     # -- external control --------------------------------------------------------------------
 

@@ -12,9 +12,23 @@ outranks both.
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("__main__")
+
+
+def _parse_time(value):
+    """An ISO timestamp from the journal, aware; None when it is not one."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 STATE_RELEASED = "released"
 STATE_BLOCKED = "blocked"
@@ -165,6 +179,79 @@ class ReleaseGate:
             "override": self._override_mode,
             "override_until": self._override_until.isoformat() if self._override_until else None,
         }
+
+    # -- after a restart ---------------------------------------------------------------
+
+    def restore(self, decisions, now, max_age_s):
+        """
+        Pick up where the gate stood before EOS Connect was restarted.
+
+        *decisions* is the journal, newest first, each with an ISO ``timestamp`` and
+        ``released``. The newest one says whether the load was released; the unbroken
+        run of equal decisions behind it says since when - so a run that was 40 minutes
+        into a 90-minute minimum keeps the remaining 50, and a rest keeps its rest. A
+        journal older than *max_age_s* describes a past nobody is still in and is
+        ignored.
+
+        Without this every restart opened with a blocked gate and no history: a heat
+        pump running at full power read as stopped, so continuing it was priced as a
+        fresh start and the first plan stopped it - 26.11., 21:34, 50 minutes into a
+        run that was planned until midnight, restarted an hour later.
+
+        Returns True when a state was restored.
+        """
+        if now.tzinfo is None:
+            now = now.astimezone()
+        entries = []
+        for row in decisions or []:
+            moment = _parse_time(row.get("timestamp"))
+            if moment is not None:
+                entries.append((moment, bool(row.get("released"))))
+        if not entries:
+            return False
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        newest, released = entries[0]
+        if (now - newest).total_seconds() > max_age_s:
+            return False
+
+        since = newest
+        for moment, state in entries[1:]:
+            # A hole in the journal is a time nobody was deciding: the run before it
+            # is not the one still going.
+            if state != released or (since - moment).total_seconds() > max_age_s:
+                break
+            since = moment
+        self.released = released
+        self.released_since = since if released else None
+        self.blocked_since = None if released else since
+        self._last_reason = REASON_PLANNED if released else REASON_NOT_PLANNED
+        logger.info(
+            "[LOADS] '%s' restored as %s since %s from its journal",
+            self.id, STATE_RELEASED if released else STATE_BLOCKED,
+            since.isoformat(timespec="minutes"),
+        )
+        return True
+
+    def adopt_running(self, power_w, threshold_w):
+        """
+        Take an appliance that is drawing power as running, when nothing better is known.
+
+        The journal's fallback: a load restored from nothing - a fresh database, an
+        outage longer than the journal is trusted for - but measurably on. Released with
+        no start time, so continuing costs no start while no minimum run is invented;
+        the next plan still decides whether it stops.
+        """
+        if self.released or power_w is None or power_w <= threshold_w:
+            return False
+        self.released = True
+        self.released_since = None
+        self.blocked_since = None
+        self._last_reason = REASON_PLANNED
+        logger.info(
+            "[LOADS] '%s' is drawing %.0f W at startup - taken as running", self.id,
+            power_w,
+        )
+        return True
 
     def status(self, now=None):
         """Current gate state without changing it."""

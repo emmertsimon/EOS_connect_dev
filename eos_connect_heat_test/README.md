@@ -18,7 +18,10 @@ Summe, keine Vervielfachung mehr; die Außentemperatur bleibt bei der letzten ec
 statt 15 °C; zerschossene Prognosestunden zählen nicht in die PV-Autoskalierung) und den
 Startkosten (`feature/heat-pump-start-cost`: `start_wear_ct` als fester Verschleiß pro Start,
 `start_loss_kwh` als Anlaufverlust, den der Optimierer im Startslot zu dessen Preis, aus dem
-Akku oder aus PV kauft; ersetzt den kleinen Gleichstand-Brecher, beide 0 = wie bisher) obendrauf.
+Akku oder aus PV kauft; ersetzt den kleinen Gleichstand-Brecher, beide 0 = wie bisher) und dem
+Neustart-Fix (`feature/gate-restore-after-restart`: nach einem Neustart übernimmt jede Last ihren
+Freigabe-Zustand samt Startzeit aus dem Entscheidungs-Journal, ein laufender Heizlauf wird nicht
+mehr gestoppt; ohne Journal zählt eine WP, die Leistung zieht, als laufend) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).
