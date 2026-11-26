@@ -3312,6 +3312,42 @@ _ALL_FIELDS: list[FieldDef] = [
         display_group="Operation",
     ),
     FieldDef(
+        key="managed_loads.start_wear_ct",
+        field_type="float",
+        default=0,
+        section="managed_loads",
+        level="expert",
+        description=(
+            "What one start costs in wear, in ct (0 = not priced). The built-in "
+            "optimizer then splits a run only where the pause saves more than a start "
+            "costs, and counts the wear in the plan's cost. Setting this or the start "
+            "loss replaces the small built-in tie-breaker"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-start-cost",
+        validation={"min": 0, "max": 500},
+        depends_on={"type": MANAGED_LOAD_CONTINGENT_TYPES},
+        display_group="Operation",
+    ),
+    FieldDef(
+        key="managed_loads.start_loss_kwh",
+        field_type="float",
+        default=0,
+        section="managed_loads",
+        level="expert",
+        description=(
+            "Electricity one start draws without delivering anything, in kWh (0 = "
+            "none) - compressor and circuit coming up to temperature. The built-in "
+            "optimizer buys it in the slot the run begins, at that slot's price, from "
+            "the battery or from surplus PV"
+        ),
+        hot_reload=True,
+        help_url="config-managed-loads.html#managed-loads-start-cost",
+        validation={"min": 0, "max": 10},
+        depends_on={"type": MANAGED_LOAD_CONTINGENT_TYPES},
+        display_group="Operation",
+    ),
+    FieldDef(
         key="managed_loads.max_runtime_hours_per_day",
         field_type="int",
         default=12,

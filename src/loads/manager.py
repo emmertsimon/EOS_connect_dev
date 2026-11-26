@@ -679,10 +679,16 @@ class ManagedLoadManager:
                     [index // ctx.slots_per_day() for index in range(slots)]
                     if ctx else []
                 ),
+                # A start priced from its wear and its loss replaces the tie-breaker:
+                # either one already makes a contiguous run the cheaper plan, and the
+                # tie-breaker is scaled by the price limit, which a store does not use.
                 "start_cost_eur": (
+                    0.0 if item.prices_starts() else
                     START_COST_SLOTS * self._value_of(item)
                     * demand.max_power_w * (ctx.hours_per_slot() if ctx else 1.0)
                 ),
+                "start_wear_eur": item.start_wear_eur(),
+                "start_loss_wh": item.start_loss_wh(),
             })
             # Only now, with the record actually going out: a load dropped by one of
             # the guards above was never offered and must keep whatever it had.

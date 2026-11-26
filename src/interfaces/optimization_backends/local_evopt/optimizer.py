@@ -448,6 +448,15 @@ class ManagedLoadConfig:
             indifferent between a contiguous run and the same energy scattered over the
             day - every schedule of the same slots costs the same - so the solver
             returns whichever the search reaches first, and the appliance cycles.
+            A tie-breaker, not a cost of the plan: it is not reported.
+        start_wear_eur: What one start costs in wear - a compressor has a budget of
+            starts, not of hours. Priced like ``start_cost_eur`` but a real cost, so it
+            is reported with the plan the way the battery's wear is.
+        start_loss_wh: Electricity a start draws on top of the run without delivering
+            heat - the compressor and the circuit coming up to temperature. It sits on
+            the demand side of the energy balance in the slot the run begins, so it is
+            bought exactly like the run itself: from the grid at that slot's tariff,
+            from the battery, or from PV that would otherwise be exported.
         efficiency: Per slot, what a Wh drawn there delivers relative to the best slot -
             a heat pump's COP at that hour's air temperature over its best, say. The
             demand and the value are both counted in delivered energy, so a slot at 0.9
@@ -466,6 +475,8 @@ class ManagedLoadConfig:
     must_wh: float = 0.0
     must_slots: Optional[List[bool]] = None
     start_cost_eur: float = 0.0
+    start_wear_eur: float = 0.0
+    start_loss_wh: float = 0.0
     # Cap on slots this load may run in one calendar day, 0 for none, with a label per
     # slot saying which day it belongs to. A label rather than a boundary because it
     # makes the same rotation into solver space as everything else indexed by slot;
@@ -495,6 +506,13 @@ class ManagedLoadConfig:
     # see PowerCurveConfig and Optimizer._refine_power_curves.
     power_w: Optional[List[float]] = None
     power_curve: Optional[PowerCurveConfig] = None
+
+    @property
+    def prices_starts(self):
+        """Whether a start costs anything - and so needs a binary of its own."""
+        return (
+            self.start_cost_eur > 0 or self.start_wear_eur > 0 or self.start_loss_wh > 0
+        )
 
     def power_at(self, t):
         """The draw while running in slot *t*: its own power, else the rating."""
@@ -828,7 +846,7 @@ class Optimizer:
             self.variables['ml_start'][i] = (
                 [self._new_var(f"ml_start_{i}_{t}", cat='Binary')
                  for t in self.time_steps]
-                if load.start_cost_eur > 0 else None
+                if load.prices_starts else None
             )
 
         # Managed loads: energy placed in each slot, and whether the appliance is
@@ -857,7 +875,7 @@ class Optimizer:
             # run to enforce, or starts being priced. Without either, the appliance may
             # be placed in any slot and the switch carries nothing the continuous
             # variable does not already have.
-            if load.min_runtime_slots > 1 or load.start_cost_eur > 0:
+            if load.min_runtime_slots > 1 or load.prices_starts:
                 self.variables['ml_on'][i] = [
                     self._new_var(f"ml_on_{i}_{t}", cat='Binary')
                     for t in self.time_steps
@@ -948,7 +966,10 @@ class Optimizer:
                 objective += load.value_eur_per_wh * self._delivered(i, load)
             starts = self.variables['ml_start'][i]
             if starts is not None:
-                objective -= load.start_cost_eur * pulp.lpSum(starts)
+                # The loss is not here: it is energy, bought in the balance.
+                objective -= (
+                    (load.start_cost_eur + load.start_wear_eur) * pulp.lpSum(starts)
+                )
             short = self.variables['ml_short'].get(i)
             if short is not None:
                 objective -= self._shortfall_price(load) * short
@@ -1128,7 +1149,7 @@ class Optimizer:
             # the point is that the solver chooses when they draw.
             managed_draw = pulp.lpSum(
                 self.variables['ml'][i][t] for i in range(len(self.managed_loads))
-            )
+            ) + self._start_loss_draw(t)
 
             self.problem += (
                 battery_net_discharge + self.time_series.ft[t] + e_grid_imp
@@ -1148,6 +1169,7 @@ class Optimizer:
             _m_imp_t = (
                 self.time_series.gt[t] + _total_c_max * _dt_h
                 + sum(load.max_power_w for load in self.managed_loads) * _dt_h
+                + sum(max(0.0, load.start_loss_wh) for load in self.managed_loads)
             )
             self.problem += self.variables['e'][t] <= _m_exp_t * self.variables['y'][t]
             self.problem += self.variables['n'][t] <= _m_imp_t * (1 - self.variables['y'][t])
@@ -1209,6 +1231,15 @@ class Optimizer:
                     self.variables['e_imp_lim_exc'][t]
                     <= self.variables['p_max_imp_exc'] * self.time_series.dt[t] / 3600
                 )
+
+    def _start_loss_draw(self, t):
+        """Electricity the starts in slot *t* draw beyond the runs themselves."""
+        draw = 0
+        for i, load in enumerate(self.managed_loads):
+            starts = self.variables['ml_start'].get(i)
+            if starts is not None and load.start_loss_wh > 0:
+                draw += load.start_loss_wh * starts[t]
+        return draw
 
     def _add_battery_constraints(self):
         """Add constraints related to battery behavior to the model."""
@@ -1514,6 +1545,7 @@ class Optimizer:
             self._add_switching_constraints(
                 on, self.variables['ml_start'][i], int(load.min_runtime_slots),
                 already_running=load.already_running or load.committed_on_slots > 0,
+                exact=load.start_loss_wh > 0,
             )
 
     def _store_values(self, load):
@@ -1781,7 +1813,8 @@ class Optimizer:
         for t in range(min(int(load.committed_off_slots), self.T)):
             self.problem += on[t] == 0
 
-    def _add_switching_constraints(self, on, starts, span, already_running=False):
+    def _add_switching_constraints(self, on, starts, span, already_running=False,
+                                   exact=False):
         """
         How long a run lasts, how long a rest lasts, and what a start is worth avoiding.
 
@@ -1791,6 +1824,10 @@ class Optimizer:
         it as a start would demand a fresh minimum run the demand may not cover. A
         *stop* in slot 0 is never counted: what came before the window is only known
         when the caller says so.
+
+        *exact* pins the start from above as well. Needed once a start draws energy:
+        at a negative tariff a start that runs nothing would be paid for drawing its
+        loss, and the solver would claim one in every slot.
         """
         def edge(t):
             if t == 0:
@@ -1817,6 +1854,15 @@ class Optimizer:
         # them to zero wherever it can and never needs the other direction pinned.
         for t in self.time_steps:
             self.problem += starts[t] >= edge(t)
+        if not exact:
+            return
+        for t in self.time_steps:
+            self.problem += starts[t] <= on[t]
+            if t == 0:
+                if already_running:
+                    self.problem += starts[0] == 0
+            else:
+                self.problem += starts[t] <= 1 - on[t - 1]
 
     def _refine_power_curves(self, solver, first_solve_s):
         """
@@ -2139,6 +2185,13 @@ class Optimizer:
                         # What it draws per slot while running - the power curve's
                         # figure at the planned temperature, else the rating.
                         'power': [load.power_at(t) for t in self.time_steps],
+                        # Where a run begins, where starts are modelled at all.
+                        **({
+                            'starts': [
+                                int(round(pulp.value(var) or 0.0))
+                                for var in self.variables['ml_start'][i]
+                            ],
+                        } if self.variables['ml_start'].get(i) is not None else {}),
                         **({
                             'temperature': [
                                 pulp.value(var) for var in self.variables['tm'][i]
@@ -2225,6 +2278,14 @@ class Optimizer:
             if bat.p_wear > 0:
                 clean_objective -= bat.p_wear * sum(
                     pulp.value(var) or 0.0 for var in self.variables['c'][i]
+                )
+        # A start's wear is real too; its loss is already in the grid and battery
+        # terms above. The tie-breaking start cost is neither and stays out.
+        for i, load in enumerate(self.managed_loads):
+            starts = self.variables['ml_start'].get(i)
+            if starts is not None and load.start_wear_eur > 0:
+                clean_objective -= load.start_wear_eur * sum(
+                    pulp.value(var) or 0.0 for var in starts
                 )
         if self.is_grid_demand_rate_active:
             clean_objective += -self.grid.prc_p_exc_imp * (

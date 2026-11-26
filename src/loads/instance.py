@@ -310,6 +310,26 @@ class ManagedLoad:
         hours = float(self.config.get("max_runtime_hours_per_day", 0) or 0)
         return int(hours * ctx.slots_per_hour()) if hours > 0 else 0
 
+    def _non_negative(self, key):
+        """A configured figure that only makes sense at zero or above."""
+        try:
+            value = float(self.config.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if math.isfinite(value) and value > 0 else 0.0
+
+    def start_wear_eur(self):
+        """What one start costs in wear (``start_wear_ct``), in EUR; 0 when unset."""
+        return self._non_negative("start_wear_ct") / 100.0
+
+    def start_loss_wh(self):
+        """Electricity one start draws without delivering (``start_loss_kwh``), in Wh."""
+        return self._non_negative("start_loss_kwh") * 1000.0
+
+    def prices_starts(self):
+        """Whether a cost per start is configured - which replaces the tie-breaker."""
+        return self.start_wear_eur() > 0 or self.start_loss_wh() > 0
+
     def min_runtime_slots(self, ctx):
         """The configured minimum run, in slots at the running resolution."""
         minutes = float(self.config.get("min_runtime_minutes", 0) or 0)
@@ -818,6 +838,13 @@ class ManagedLoad:
             "price_is_shared": self.last_cost_is_shared,
             # Set when no setting can close the gap, so the card stops naming one.
             "over_committed": over_committed,
+            # Separate runs still ahead, one already under way included - for a
+            # compressor the number that matters more than the energy.
+            "planned_runs": sum(
+                1 for index, reason in enumerate(reasons)
+                if reason == SLOT_PLANNED
+                and (index == 0 or reasons[index - 1] != SLOT_PLANNED)
+            ),
             "reachable_wh": round(reachable_wh, 1),
             "shortfall_wh": round(max(0.0, needed - self.delivered_wh()), 1),
         }
