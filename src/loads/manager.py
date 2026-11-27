@@ -1016,8 +1016,12 @@ class ManagedLoadManager:
             "released": bool(release.get("released")),
             "reason": release.get("reason", ""),
             "current_slot": ctx.current_slot,
+            # The gate's own verdict where it gave one. "Any energy in the slot" read
+            # true on the very decisions that stopped a load for too little of it.
             "planned_now": bool(
-                0 <= ctx.current_slot < len(plan) and plan[ctx.current_slot] > 0
+                release["planned_now"] if "planned_now" in release else (
+                    0 <= ctx.current_slot < len(plan) and plan[ctx.current_slot] > 0
+                )
             ),
             # A short digest of *which* slots, so churn is one GROUP BY rather than a
             # walk over a week of arrays.
