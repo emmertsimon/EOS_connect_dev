@@ -21,7 +21,10 @@ Startkosten (`feature/heat-pump-start-cost`: `start_wear_ct` als fester Verschle
 Akku oder aus PV kauft; ersetzt den kleinen Gleichstand-Brecher, beide 0 = wie bisher) und dem
 Neustart-Fix (`feature/gate-restore-after-restart`: nach einem Neustart übernimmt jede Last ihren
 Freigabe-Zustand samt Startzeit aus dem Entscheidungs-Journal, ein laufender Heizlauf wird nicht
-mehr gestoppt; ohne Journal zählt eine WP, die Leistung zieht, als laufend) obendrauf.
+mehr gestoppt; ohne Journal zählt eine WP, die Leistung zieht, als laufend) und dem
+Viertelstunden-Fix (`feature/gate-slot-end`: eine laufende Last wird in den letzten 90 s einer
+Viertelstunde nach der nächsten beurteilt und nicht mehr Sekunden vor einem geplanten Slot gestoppt;
+kann nur einen Stopp verhindern, nie einen Start auslösen) obendrauf.
 Quellstand: Branch `test/develop400-heating-curve-limit` in diesem Repo.
 
 - Wird auf dem HA-Host lokal gebaut (dauert einige Minuten).
