@@ -85,6 +85,9 @@ def _offerable(demand):
 _INTERNAL_TTL_CYCLES = 3
 # Below this a slot's planned energy is solver residue, not a plan (see _gate_on).
 RUN_THRESHOLD_MIN_WH = 1.0
+# The last seconds of a slot in which a running load is judged by the slot after it
+# (see _carries_into_next_slot). Wider than the 60 s the run threshold never goes below.
+SLOT_END_CARRY_SECONDS = 90
 _INTERNAL_TTL_MIN_MINUTES = 15
 
 
@@ -559,6 +562,8 @@ class ManagedLoad:
         planned_now = (
             0 <= ctx.current_slot < len(plan)
             and plan[ctx.current_slot] >= self._run_threshold_wh(demand, ctx)
+        ) or (
+            self.gate.released and self._carries_into_next_slot(demand, ctx, plan)
         )
         release = self.gate.evaluate(
             planned=planned_now,
@@ -572,7 +577,43 @@ class ManagedLoad:
         )
         release["next_release_start"] = self._next_release_start(plan, ctx)
         release["energy_needed_wh"] = round(demand.total_wh, 1)
+        # What the gate was told, so the journal shows the verdict it acted on and not
+        # a looser reading of the same plan.
+        release["planned_now"] = bool(planned_now)
         return release
+
+    @staticmethod
+    def _carries_into_next_slot(demand, ctx, plan):
+        """
+        Whether a running load should be judged by the slot that starts in a moment.
+
+        The plan for the running slot only holds the part of it that was still ahead
+        when the solver *started*, while the gate asks after the solver has finished -
+        and asks for at least a minute's worth. A heat pump solved from 01:14:35 had
+        11 Wh in a slot ending at 01:15, met a 13 Wh threshold at 01:14:58, and was
+        stopped 2 s before a slot the same plan had at full power (27.11.; again at
+        05:44:58 with 5 Wh). Once stopped, carrying on was a fresh start, so the next
+        plan put it off - two starts that no plan had asked for.
+
+        In the last SLOT_END_CARRY_SECONDS of a slot the next slot decides instead, if
+        it is planned by the same measure as a whole slot. Only for a load already
+        running: it can stop a stop, never cause a start.
+        """
+        anchor = getattr(ctx, "anchor", None)
+        if anchor is None or ctx.now is None:
+            return False
+        following = ctx.current_slot + 1
+        if not 0 <= following < len(plan):
+            return False
+        slot_end = anchor + timedelta(seconds=following * ctx.time_frame_base)
+        if (slot_end - ctx.now).total_seconds() > SLOT_END_CARRY_SECONDS:
+            return False
+        if getattr(demand, "power_w", None):
+            floor_w, share = float(demand.power_at(following)), 0.5
+        else:
+            floor_w, share = float(demand.max_power_w or 0.0), 0.05
+        threshold = max(RUN_THRESHOLD_MIN_WH, share * floor_w * ctx.hours_per_slot())
+        return plan[following] >= threshold
 
     @staticmethod
     def _run_threshold_wh(demand, ctx):
